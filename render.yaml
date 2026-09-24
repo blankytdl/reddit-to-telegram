@@ -1,0 +1,83 @@
+services:
+  - type: web
+    name: reddit-telegram-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false        # set the real value in the Render dashboard, not here
+      - key: DATA_DIR
+        value: .           # free tier has no persistent disk - "seen" files
+                            # reset on every deploy/restart no matter what path
+                            # this points at, so a plain local folder is fine
+      # Render sets PORT and RENDER_EXTERNAL_URL itself for Web Services;
+      # main.py reads both automatically (health server + self-pinger).
+
+      # ---- subreddits → Telegram channels (fully customizable, no code edits) ----
+      # Add one NAME/CHAT_ID pair per subreddit you want to mirror. Keep numbering
+      # sequential (1, 2, 3, ...) — the bot stops at the first missing NAME.
+      # SORT/LIMIT are optional per-subreddit; leave them out to use the defaults
+      # below (or hardcoded fallbacks of "new" / 12 if the defaults are unset too).
+      #
+      # Multiple subreddits → one channel: just give two SUBREDDIT_N entries the
+      # same CHAT_ID value (see #1 and #3 below).
+      - key: SUBREDDIT_1_NAME
+        value: ""          # subreddit name, no "r/" prefix, e.g. "aww"
+      - key: SUBREDDIT_1_CHAT_ID
+        value: ""          # Telegram @channel_username or numeric chat id
+      # - key: SUBREDDIT_1_SORT
+      #   value: new                # "new" or "hot"
+      # - key: SUBREDDIT_1_LIMIT
+      #   value: "12"                # how many latest posts to look at per fetch
+      - key: SUBREDDIT_2_NAME
+        value: ""
+      - key: SUBREDDIT_2_CHAT_ID
+        value: ""
+      # - key: SUBREDDIT_3_NAME
+      #   value: ""
+      # - key: SUBREDDIT_3_CHAT_ID       # set this to the SAME value as
+      #   value: ""                       # SUBREDDIT_1_CHAT_ID to feed both
+      #                                    # subreddits into one channel
+      # ...add SUBREDDIT_4_*, SUBREDDIT_5_*, etc. the same way for more.
+
+      # Optional: fallback sort/limit applied to any subreddit above that
+      # doesn't set its own SUBREDDIT_N_SORT / SUBREDDIT_N_LIMIT.
+      # - key: SUBREDDIT_DEFAULT_SORT
+      #   value: new
+      # - key: SUBREDDIT_DEFAULT_LIMIT
+      #   value: "12"
+
+      # Optional: skip link/self-text posts (no image/gif/video) entirely
+      # instead of sending them as plain text messages. Defaults to "true".
+      # - key: SKIP_TEXT_ONLY_POSTS
+      #   value: "true"
+
+      # ---- optional: back "seen" state up into the repo itself ----
+      # Leave both unset to disable this and keep the old local-file-only
+      # behavior. Set both to have the bot restore "seen" IDs on startup
+      # and periodically commit updates to a DEDICATED branch (default
+      # "bot-state") that Render does NOT deploy from -- see config.py for
+      # full setup notes and why that branch must stay separate from the
+      # one Render tracks (a shared branch would trigger a redeploy loop).
+      - key: GITHUB_TOKEN
+        sync: false        # fine-grained PAT, Contents: read/write, this repo only
+      - key: GITHUB_REPO
+        sync: false        # "your-username/your-repo-name"
+      # - key: GITHUB_STATE_BRANCH
+      #   value: bot-state          # default; only override if you need to
+      # - key: GITHUB_SYNC_INTERVAL_SECONDS
+      #   value: "300"              # default; how often to push a backup commit
+
+# ----------------------- how this stays awake -----------------------
+# main.py starts a background thread that GETs its own RENDER_EXTERNAL_URL
+# every 10 minutes, which counts as inbound traffic and resets Render's
+# ~15-minute idle-spindown timer - no external cron/uptime service needed.
+#
+# Caveat: the self-ping only works while the instance is already awake and
+# this loop is running. If Render ever does spin it down (e.g. a slow cold
+# start after a deploy pushes past 15 min before the loop starts pinging),
+# nothing wakes it back up until an actual visitor (or you) hits the URL.
+# If you want a true always-on guarantee, an external pinger or the paid
+# Background Worker plan is more robust than self-pinging.
