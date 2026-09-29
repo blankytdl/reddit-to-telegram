@@ -1,5 +1,6 @@
 # ───────────────────────── Telegram ─────────────────────────
 import os
+import re
 
 # One bot, used for all channels. The token now comes from an environment
 # variable instead of being hardcoded here, so it never has to live in a
@@ -108,7 +109,7 @@ while True:
     _sort = os.environ.get(f"SUBREDDIT_{_i}_SORT", DEFAULT_SORT)
     _limit = int(os.environ.get(f"SUBREDDIT_{_i}_LIMIT", str(DEFAULT_LIMIT)))
     SUBREDDITS.append({
-        "name": _name.strip().lstrip("r/").lstrip("/"),
+        "name": re.sub(r"^/?(?:r/)?", "", _name.strip(), flags=re.I),
         "chat_id": _chat_id.strip(),
         "sort": _sort,
         "limit": _limit,
