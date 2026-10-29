@@ -15,6 +15,7 @@ import io
 import time
 
 import requests
+from requests_toolbelt.multipart.encoder import MultipartEncoder
 from PIL import Image
 
 from config import TELEGRAM_BOT_TOKEN
@@ -135,33 +136,44 @@ def _post(method: str, data: dict, files: dict | None = None, timeout: int = 120
     url = f"{API_BASE}/{method}"
     for attempt in range(3):
         try:
-            resp = requests.post(url, data=data, files=files, timeout=timeout)
+            if files and any(hasattr(item[1], "read") for item in files.values()):
+                fields = dict(data or {})
+                fields.update(files)
+                encoder = MultipartEncoder(fields=fields)
+                response = requests.post(url, data=encoder, headers={"Content-Type": encoder.content_type}, timeout=timeout)
+            else:
+                response = requests.post(url, data=data, files=files, timeout=timeout)
         except Exception as e:
             print(f"  Telegram request error ({method}): {e}")
             return None
 
-        if resp.status_code == 200:
-            return resp.json()
+        with response as resp:
+            if resp.status_code == 200:
+                try:
+                    result = resp.json()
+                except ValueError:
+                    result = None
+                return result if isinstance(result, dict) and result.get("ok") is True else None
 
-        if resp.status_code == 429:
-            retry_after = 5
-            try:
-                retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
-            except Exception:
-                pass
-            print(f"  Telegram 429 on {method}, waiting {retry_after}s...")
-            time.sleep(retry_after + 1)
-            continue
+            if resp.status_code == 429:
+                retry_after = 5
+                try:
+                    retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
+                except Exception:
+                    pass
+                print(f"  Telegram 429 on {method}, waiting {retry_after}s...")
+                time.sleep(retry_after + 1)
+                continue
 
-        print(f"  Telegram error {resp.status_code} on {method}: {resp.text[:200]}")
-        return None
+            print(f"  Telegram error {resp.status_code} on {method}: {resp.text[:200]}")
+            return None
 
     return None
 
 
 # ───────────────────────── public API ─────────────────────────
-def send_message(chat_id: str, text: str):
-    _post(
+def send_message(chat_id: str, text: str) -> bool:
+    return _post(
         "sendMessage",
         data={
             "chat_id": chat_id,
@@ -172,23 +184,23 @@ def send_message(chat_id: str, text: str):
     )
 
 
-def send_photo(chat_id: str, data: bytes, caption: str = "", spoiler: bool = False):
+def send_photo(chat_id: str, data: bytes, caption: str = "", spoiler: bool = False) -> bool:
     fixed = fix_image_bytes(data)
     payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
     if spoiler:
         payload["has_spoiler"] = True
-    _post("sendPhoto", data=payload, files={"photo": ("photo.jpg", fixed)})
+    return _post("sendPhoto", data=payload, files={"photo": ("photo.jpg", fixed)}) is not None
 
 
-def send_video(chat_id: str, data: bytes, caption: str = "", spoiler: bool = False):
+def send_video(chat_id: str, data, caption: str = "", spoiler: bool = False) -> bool:
     payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
     if spoiler:
         payload["has_spoiler"] = True
-    _post("sendVideo", data=payload, files={"video": ("video.mp4", data)})
+    return _post("sendVideo", data=payload, files={"video": ("video.mp4", data, "video/mp4")}) is not None
 
 
-def send_animation(chat_id: str, data: bytes, caption: str = "", spoiler: bool = False):
+def send_animation(chat_id: str, data: bytes, caption: str = "", spoiler: bool = False) -> bool:
     payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
     if spoiler:
         payload["has_spoiler"] = True
-    _post("sendAnimation", data=payload, files={"animation": ("animation.gif", data)})
+    return _post("sendAnimation", data=payload, files={"animation": ("animation.gif", data)}) is not None
