@@ -2,3 +2,4 @@ requests>=2.31.0
 feedparser>=6.0.11
 imageio-ffmpeg>=0.5.1
 Pillow>=10.0.0
+requests-toolbelt>=1.0.0
