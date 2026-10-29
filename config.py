@@ -48,11 +48,11 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "")          # "owner/repo"
 GITHUB_STATE_BRANCH = os.environ.get("GITHUB_STATE_BRANCH", "bot-state")
 GITHUB_SEEN_PATH = os.environ.get("GITHUB_SEEN_PATH", "seen").strip("/")
 
-# How often to push any changed "seen" files to GitHub. Kept infrequent on
-# purpose — this batches every post from the last interval into one commit
-# per changed subreddit instead of committing after every single post,
-# which would spam the repo's history and burn through GitHub's API rate
-# limit for no benefit (only the latest state after a restart matters).
+# How often to push changed "seen" files to GitHub. The 60-second default
+# narrows the restart-loss window while batching posts into one commit per
+# changed subreddit instead of committing after every single post. If
+# GITHUB_SYNC_INTERVAL_SECONDS is set in the host environment, that value
+# overrides this default.
 GITHUB_SYNC_INTERVAL_SECONDS = int(os.environ.get("GITHUB_SYNC_INTERVAL_SECONDS", "60"))
 
 if bool(GITHUB_TOKEN) != bool(GITHUB_REPO):
