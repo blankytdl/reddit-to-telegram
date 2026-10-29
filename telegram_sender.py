@@ -181,7 +181,7 @@ def send_message(chat_id: str, text: str) -> bool:
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
         },
-    )
+    ) is not None
 
 
 def send_photo(chat_id: str, data: bytes, caption: str = "", spoiler: bool = False) -> bool:
