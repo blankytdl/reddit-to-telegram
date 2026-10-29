@@ -65,13 +65,24 @@ VIDEO_EXTS = (".mp4", ".webm")
 # check will consider the deploy dead. The bot itself has no reason to serve
 # HTTP — this endpoint exists purely so Render's health check (and our own
 # self-pinger below) have something to hit.
-_last_tick = time.time()
+# Health is based on actual bot-loop progress, not HTTP requests. Keep the
+# threshold above the maximum bounded media operation and normal subreddit cycle.
+_last_tick = time.monotonic()
+
+def _mark_progress():
+    global _last_tick
+    _last_tick = time.monotonic()
+
+HEALTH_STALE_SECONDS = int(os.environ.get("HEALTH_STALE_SECONDS", "900"))
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        idle = time.time() - _last_tick
-        body = f"ok - bot loop last ticked {idle:.0f}s ago\n".encode()
-        self.send_response(200)
+        idle = time.monotonic() - _last_tick
+        healthy = idle <= HEALTH_STALE_SECONDS
+        status = 200 if healthy else 503
+        state = "ok" if healthy else "stalled"
+        body = f"{state} - bot loop last made progress {idle:.0f}s ago (limit {HEALTH_STALE_SECONDS}s)\n".encode()
+        self.send_response(status)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -419,42 +430,66 @@ def download_bytes(url: str, timeout: int = 90, max_bytes: int = MAX_MEDIA_DOWNL
     except Exception:
         return None
 
-def download_to_file(url: str, path: str) -> bool:
+def download_to_file(
+    url: str,
+    path: str,
+    max_bytes: int = MAX_MEDIA_DOWNLOAD_BYTES,
+    deadline_seconds: int = 45,
+) -> bool:
+    """Download media with a size cap, elapsed-time limit, and reliable cleanup."""
+    deadline = time.monotonic() + deadline_seconds
+    total = 0
     try:
-        r = requests.get(url, headers=HEADERS, timeout=120, stream=True)
-        if r.status_code != 200:
-            return False
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(256 * 1024):
-                f.write(chunk)
-        return True
-    except Exception:
+        with requests.get(url, headers=HEADERS, timeout=(10, 15), stream=True) as r:
+            if r.status_code != 200:
+                print(f"  Media download HTTP {r.status_code}: {url}")
+                return False
+            length = r.headers.get("Content-Length")
+            if length and length.isdigit() and int(length) > max_bytes:
+                print(f"  Media exceeds {max_bytes / 1e6:.0f}MB cap: {url}")
+                return False
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(256 * 1024):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("media download exceeded total deadline")
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"media exceeded {max_bytes / 1e6:.0f}MB cap")
+                    f.write(chunk)
+        return total > 0
+    except Exception as e:
+        print(f"  Media download failed ({type(e).__name__}): {url}: {e}")
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
         return False
 
 # ───────────────────────── media handlers ─────────────────────────
-def handle_image(chat_id: str, url: str, caption: str, spoiler: bool):
+def handle_image(chat_id: str, url: str, caption: str, spoiler: bool) -> bool:
     data = download_bytes(url)
-    if data:
-        send_photo(chat_id, data, caption=caption, spoiler=spoiler)
+    return bool(data) and send_photo(chat_id, data, caption=caption, spoiler=spoiler)
 
-def handle_gif(chat_id: str, url: str, caption: str, spoiler: bool):
+def handle_gif(chat_id: str, url: str, caption: str, spoiler: bool) -> bool:
     data = download_bytes(url)
-    if data:
-        send_animation(chat_id, data, caption=caption, spoiler=spoiler)
+    return bool(data) and send_animation(chat_id, data, caption=caption, spoiler=spoiler)
 
-def handle_direct_video(chat_id: str, url: str, caption: str, spoiler: bool):
+def handle_direct_video(chat_id: str, url: str, caption: str, spoiler: bool) -> bool:
     data = download_bytes(url)
-    if data:
-        send_video(chat_id, data, caption=caption, spoiler=spoiler)
+    return bool(data) and send_video(chat_id, data, caption=caption, spoiler=spoiler)
 
-def handle_reddit_video(chat_id: str, video_url: str, caption: str, spoiler: bool):
+def handle_reddit_video(chat_id: str, video_url: str, caption: str, spoiler: bool) -> bool:
     with tempfile.TemporaryDirectory() as tmp:
         video_path  = os.path.join(tmp, "video.mp4")
         audio_path  = os.path.join(tmp, "audio.mp4")
         merged_path = os.path.join(tmp, "merged.mp4")
 
+        print(f"  Video download started: {video_url}")
         if not download_to_file(video_url, video_path):
-            return
+            return False
 
         base = video_url.rsplit("/", 1)[0]
         audio_candidates = [
@@ -465,8 +500,17 @@ def handle_reddit_video(chat_id: str, video_url: str, caption: str, spoiler: boo
         ]
 
         audio_ok = False
+        audio_deadline = time.monotonic() + 120
         for aurl in audio_candidates:
-            if download_to_file(aurl, audio_path) and os.path.getsize(audio_path) > 2000:
+            if time.monotonic() >= audio_deadline:
+                print("  Audio track attempts stopped: 120s total budget reached")
+                break
+            try:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+            except OSError:
+                pass
+            if download_to_file(aurl, audio_path, deadline_seconds=35) and os.path.getsize(audio_path) > 2000:
                 audio_ok = True
                 break
 
@@ -494,8 +538,10 @@ def handle_reddit_video(chat_id: str, video_url: str, caption: str, spoiler: boo
             except Exception:
                 pass
 
+        # Stream from disk into the multipart upload instead of duplicating
+        # the entire video in RAM. Telegram's sender accepts file-like objects.
         with open(final, "rb") as f:
-            send_video(chat_id, f.read(), caption=caption, spoiler=spoiler)
+            return send_video(chat_id, f, caption=caption, spoiler=spoiler)
 
 # ───────────────────────── media extraction ─────────────────────────
 def extract_media_url(entry) -> str | None:
@@ -572,15 +618,15 @@ def process_entry(entry: dict, seen: set, sub: dict):
 
     try:
         if media_url and any(lower.endswith(ext) for ext in IMAGE_EXTS):
-            handle_image(chat_id, media_url, caption, spoiler)
+            delivered = handle_image(chat_id, media_url, caption, spoiler)
         elif media_url and any(lower.endswith(ext) for ext in GIF_EXTS):
-            handle_gif(chat_id, media_url, caption, spoiler)
+            delivered = handle_gif(chat_id, media_url, caption, spoiler)
         elif media_url and "v.redd.it" in lower:
             if not media_url.endswith(".mp4"):
                 media_url = media_url.rstrip("/") + "/DASH_720.mp4"
-            handle_reddit_video(chat_id, media_url, caption, spoiler)
+            delivered = handle_reddit_video(chat_id, media_url, caption, spoiler)
         elif media_url and any(lower.endswith(ext) for ext in VIDEO_EXTS):
-            handle_direct_video(chat_id, media_url, caption, spoiler)
+            delivered = handle_direct_video(chat_id, media_url, caption, spoiler)
         elif SKIP_TEXT_ONLY_POSTS:
             seen.add(post_id)
             save_seen(subreddit, seen)
@@ -590,11 +636,14 @@ def process_entry(entry: dict, seen: set, sub: dict):
             text = caption if caption else html.escape(title)
             if link:
                 text += f"\n\n{link}"
-            send_message(chat_id, text)
+            delivered = send_message(chat_id, text)
 
-        seen.add(post_id)
-        save_seen(subreddit, seen)
-        print(f"✓ [{subreddit}] Posted: {title[:70]}")
+        if delivered:
+            seen.add(post_id)
+            save_seen(subreddit, seen)
+            print(f"✓ [{subreddit}] Posted: {title[:70]}")
+        else:
+            print(f"✗ [{subreddit}] Delivery failed for {post_id}; will retry on a later fetch")
     except Exception as e:
         print(f"✗ [{subreddit}] Failed {post_id}: {e}")
 
@@ -635,6 +684,8 @@ def fetch_and_process(sub: dict, seen: set) -> float:
 
         feed = feedparser.parse(resp.content)
         entries = feed.entries[:limit]
+        _mark_progress()
+        print(f"RSS fetched for r/{subreddit}: {len(entries)} entries")
 
         for entry in reversed(entries):
             process_entry(entry, seen, sub)
@@ -694,7 +745,8 @@ def main():
     while True:
         now = time.time()
         global _last_tick
-        _last_tick = now
+        _mark_progress()
+        _last_tick = time.monotonic()
         for sub in SUBREDDITS:
             name = sub["name"]
             if now < due_at[name]:
