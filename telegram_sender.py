@@ -137,7 +137,7 @@ def _post(method: str, data: dict, files: dict | None = None, timeout: int = 120
     for attempt in range(3):
         try:
             if files and any(hasattr(item[1], "read") for item in files.values()):
-                fields = dict(data or {})
+                fields = {key: str(value) for key, value in (data or {}).items()}
                 fields.update(files)
                 encoder = MultipartEncoder(fields=fields)
                 response = requests.post(url, data=encoder, headers={"Content-Type": encoder.content_type}, timeout=timeout)
