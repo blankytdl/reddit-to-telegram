@@ -190,7 +190,7 @@ def github_fetch_seen(sub_name: str) -> Optional[set]:
         return None
 
 
-def github_push_seen(sub_name: str, seen: set):
+def github_push_seen(sub_name: str, seen: set) -> bool:
     """
     Push one subreddit's current seen-IDs set to GITHUB_STATE_BRANCH as a
     commit. Creates the branch (from the repo's default branch) and the
@@ -198,7 +198,7 @@ def github_push_seen(sub_name: str, seen: set):
     than raising, since losing a backup write should never crash the bot.
     """
     if not _GITHUB_ENABLED:
-        return
+        return False
 
     body = json.dumps(sorted(seen)[-3000:]).encode("utf-8")
     payload = {
@@ -219,7 +219,8 @@ def github_push_seen(sub_name: str, seen: set):
         )
         if r.status_code in (200, 201):
             _github_shas[sub_name] = r.json()["content"]["sha"]
-            return
+            print(f"[github] pushed {sub_name}: {len(seen)} seen IDs")
+            return True
 
         if r.status_code == 404:
             # Almost always means GITHUB_STATE_BRANCH doesn't exist yet.
@@ -235,9 +236,10 @@ def github_push_seen(sub_name: str, seen: set):
                 )
                 if r2.status_code in (200, 201):
                     _github_shas[sub_name] = r2.json()["content"]["sha"]
-                    return
+                    print(f"[github] pushed {sub_name}: {len(seen)} seen IDs (retry succeeded)")
+                    return True
                 print(f"[github] retry push {sub_name} → HTTP {r2.status_code}: {r2.text[:200]}")
-            return
+            return False
 
         if r.status_code == 409:
             # sha we had is stale (e.g. file edited outside the bot) —
@@ -253,13 +255,16 @@ def github_push_seen(sub_name: str, seen: set):
                 )
                 if r2.status_code in (200, 201):
                     _github_shas[sub_name] = r2.json()["content"]["sha"]
-                    return
-            print(f"[github] push {sub_name} conflict, giving up this round")
-            return
+                    print(f"[github] pushed {sub_name}: {len(seen)} seen IDs (retry succeeded)")
+                    return True
+            print(f"[github] push {sub_name} conflict, will retry next sync")
+            return False
 
-        print(f"[github] push {sub_name} → HTTP {r.status_code}: {r.text[:200]}")
+        print(f"[github] push {sub_name} → HTTP {r.status_code}: {r.text[:200]} (will retry next sync)")
+        return False
     except Exception as e:
-        print(f"[github] push {sub_name} errored: {e}")
+        print(f"[github] push {sub_name} errored: {e} (will retry next sync)")
+        return False
 
 
 def _github_create_branch_if_missing() -> bool:
@@ -316,16 +321,28 @@ def start_github_syncer():
 
 
 def flush_dirty_seen_to_github():
-    """Push every subreddit marked dirty since the last flush, then clear it."""
+    """
+    Push changed subreddit state. Keep failed writes dirty for the next round,
+    and only clear a subreddit after success if its state hasn't changed
+    while the network request was in flight.
+    """
     if not _GITHUB_ENABLED:
         return
     with _github_lock:
-        pending = list(_github_dirty)
-        _github_dirty.clear()
-    for sub_name in pending:
-        seen = _current_seen.get(sub_name)
-        if seen is not None:
-            github_push_seen(sub_name, seen)
+        pending = {
+            name: set(_current_seen[name])
+            for name in _github_dirty
+            if name in _current_seen
+        }
+    for sub_name, snapshot in pending.items():
+        if github_push_seen(sub_name, snapshot):
+            with _github_lock:
+                # If a post was added during the upload, leave it dirty so
+                # the newer state is pushed on the next sync.
+                if _current_seen.get(sub_name) == snapshot:
+                    _github_dirty.discard(sub_name)
+        # On failure, leave the name in _github_dirty; next periodic round
+        # will retry automatically.
 
 
 # ───────────────────────── per-subreddit seen tracking ─────────────────────────
