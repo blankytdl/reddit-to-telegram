@@ -408,9 +408,11 @@ def download_bytes(url: str, timeout: int = 90, max_bytes: int = MAX_MEDIA_DOWNL
     unexpectedly huge file (or someone's 80MB "meme") is exactly the kind of
     thing that can OOM a small container even before Pillow gets involved.
     """
+    deadline = time.monotonic() + min(timeout, 45)
     try:
-        with requests.get(url, headers=HEADERS, timeout=timeout, stream=True) as r:
+        with requests.get(url, headers=HEADERS, timeout=(10, 15), stream=True) as r:
             if r.status_code != 200:
+                print(f"  Media download HTTP {r.status_code}: {url}")
                 return None
 
             content_length = r.headers.get("Content-Length")
@@ -421,13 +423,19 @@ def download_bytes(url: str, timeout: int = 90, max_bytes: int = MAX_MEDIA_DOWNL
             chunks = []
             total = 0
             for chunk in r.iter_content(256 * 1024):
+                if time.monotonic() > deadline:
+                    print(f"  Aborting media download after time limit: {url}")
+                    return None
+                if not chunk:
+                    continue
                 total += len(chunk)
                 if total > max_bytes:
                     print(f"  Aborting download, exceeded {max_bytes/1e6:.0f}MB cap: {url}")
                     return None
                 chunks.append(chunk)
             return b"".join(chunks)
-    except Exception:
+    except Exception as e:
+        print(f"  Media download failed ({type(e).__name__}): {url}: {e}")
         return None
 
 def download_to_file(
