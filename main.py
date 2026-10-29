@@ -75,6 +75,21 @@ def _mark_progress():
 
 HEALTH_STALE_SECONDS = int(os.environ.get("HEALTH_STALE_SECONDS", "900"))
 
+# Shared Reddit cooldown: when one feed receives a 429, pause all feeds.
+_reddit_cooldown_until = 0.0
+_reddit_cooldown_lock = threading.Lock()
+_last_scheduler_report = 0.0
+
+def _set_reddit_cooldown(seconds: float):
+    global _reddit_cooldown_until
+    seconds = max(30.0, min(float(seconds), 900.0))
+    with _reddit_cooldown_lock:
+        _reddit_cooldown_until = max(_reddit_cooldown_until, time.monotonic() + seconds)
+
+def _reddit_cooldown_remaining() -> float:
+    with _reddit_cooldown_lock:
+        return max(0.0, _reddit_cooldown_until - time.monotonic())
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         idle = time.monotonic() - _last_tick
@@ -297,7 +312,6 @@ def _github_create_branch_if_missing() -> bool:
     except Exception as e:
         print(f"[github] couldn't create branch '{GITHUB_STATE_BRANCH}': {e}")
         return False
-
 
 def start_github_syncer():
     """
@@ -596,8 +610,7 @@ def extract_media_url(entry) -> str | None:
     ]
 
     for pat in patterns:
-        matches = re.findall(pat, summary, re.IGNORECASE)
-        for m in matches:
+        matches = re.findall(pat, summary, re.IGNORECASE)        for m in matches:
             if isinstance(m, tuple):
                 m = m[0]
             candidates.append(m)
@@ -679,6 +692,15 @@ def process_entry(entry: dict, seen: set, channel_seen: set, sub: dict):
             delivered = send_message(chat_id, text)
 
         _mark_progress()
+        # If media hosting rejects a download, deliver the Reddit permalink
+        # instead. This avoids repeatedly retrying the same inaccessible media.
+        if not delivered and media_url:
+            fallback = caption or html.escape(title)
+            if link:
+                fallback += f"\\n\\n{link}"
+            print(f"  [{subreddit}] Media failed; trying Reddit-link fallback")
+            delivered = send_message(chat_id, fallback)
+
         if delivered:
             seen.add(post_id)
             channel_seen.add(post_id)
@@ -717,11 +739,14 @@ def fetch_and_process(sub: dict, seen: set, channel_seen: set) -> float:
                 backoff = max(backoff, int(retry_after))
             elif reset and reset.replace(".", "", 1).isdigit():
                 backoff = max(backoff, int(float(reset)))
-            print(f"RSS 429 for r/{subreddit}, backing off {backoff}s")
+            _set_reddit_cooldown(backoff)
+            print(f"RSS 429 for r/{subreddit}, backing off {backoff}s (shared cooldown)")
             return backoff
 
         if resp.status_code != 200:
             print(f"RSS status {resp.status_code} for r/{subreddit}")
+            if resp.status_code in (403, 429, 500, 502, 503, 504):
+                _set_reddit_cooldown(DEFAULT_429_BACKOFF_SECONDS)
             return DEFAULT_429_BACKOFF_SECONDS
 
         feed = feedparser.parse(resp.content)
@@ -791,24 +816,38 @@ def main():
     due_at = {s["name"]: 0.0 for s in SUBREDDITS}
 
     while True:
-        now = time.time()
-        global _last_tick
+        global _last_tick, _last_scheduler_report
         _mark_progress()
-        _last_tick = time.monotonic()
+        cooldown = _reddit_cooldown_remaining()
+        if cooldown > 0:
+            if time.monotonic() - _last_scheduler_report >= 30:
+                print(f"[scheduler] Reddit-wide cooldown; next check in about {cooldown:.0f}s")
+                _last_scheduler_report = time.monotonic()
+            time.sleep(min(SCHEDULER_TICK_SECONDS, max(1.0, cooldown)))
+            continue
+
+        fetched_any = False
         for sub in SUBREDDITS:
             name = sub["name"]
+            now = time.time()
             if now < due_at[name]:
                 continue
 
+            fetched_any = True
+            _mark_progress()
+            print(f"[scheduler] Checking r/{name}")
             backoff = fetch_and_process(sub, seen[name], channel_seen.setdefault(str(sub["chat_id"]), set()))
-            now = time.time()
-            due_at[name] = now + MIN_SECONDS_BETWEEN_FETCHES_PER_SUB + backoff
-
-            # Keep subreddits strictly in order, spaced apart, even when
-            # several become due around the same time.
+            due_at[name] = time.time() + MIN_SECONDS_BETWEEN_FETCHES_PER_SUB + backoff
+            if _reddit_cooldown_remaining() > 0:
+                break
             time.sleep(DELAY_BETWEEN_SUBREDDITS)
-            now = time.time()
 
+        if not fetched_any and time.monotonic() - _last_scheduler_report >= 60:
+            wait_for = min((max(0.0, due - time.time()) for due in due_at.values()), default=0.0)
+            print(f"[scheduler] Idle normally; next feed due in about {wait_for:.0f}s")
+            _last_scheduler_report = time.monotonic()
+
+        _mark_progress()
         time.sleep(SCHEDULER_TICK_SECONDS)
 
 if __name__ == "__main__":
