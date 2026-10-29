@@ -603,7 +603,7 @@ def extract_media_url(entry) -> str | None:
 
     return clean[0] if clean else None
 
-def process_entry(entry: dict, seen: set, sub: dict):
+def process_entry(entry: dict, seen: set, channel_seen: set, sub: dict):
     _mark_progress()
     subreddit = sub["name"]
     chat_id = sub["chat_id"]
@@ -611,9 +611,22 @@ def process_entry(entry: dict, seen: set, sub: dict):
     link = entry.get("link", "")
     title = entry.get("title", "")
     author = entry.get("author", "unknown").replace("/u/", "").replace("u/", "")
-    post_id = link.rstrip("/").split("/")[-1] if link else None
+    # Reddit RSS links end with a title slug, not the post ID. Extract the
+    # stable ID from /comments/<id>/ so title/URL variations cannot bypass dedupe.
+    match = re.search(r"/comments/([a-z0-9]+)(?:/|$)", urlparse(link).path, re.IGNORECASE)
+    post_id = match.group(1).lower() if match else (
+        urlparse(link).path.rstrip("/").split("/")[-1].lower() if link else None
+    )
 
     if not post_id or post_id in seen:
+        return
+
+    # Multiple configured subreddit feeds may contain the same Reddit post.
+    # Deduplicate per Telegram destination, not just per subreddit.
+    if post_id in channel_seen:
+        seen.add(post_id)
+        save_seen(subreddit, seen)
+        print(f"↪ [{subreddit}] Suppressed duplicate for destination {chat_id}: {post_id}")
         return
 
     permalink = urlparse(link).path
@@ -638,6 +651,7 @@ def process_entry(entry: dict, seen: set, sub: dict):
             delivered = handle_direct_video(chat_id, media_url, caption, spoiler)
         elif SKIP_TEXT_ONLY_POSTS:
             seen.add(post_id)
+            channel_seen.add(post_id)
             save_seen(subreddit, seen)
             print(f"– [{subreddit}] Skipped (no media): {title[:70]}")
             return
@@ -650,6 +664,7 @@ def process_entry(entry: dict, seen: set, sub: dict):
         _mark_progress()
         if delivered:
             seen.add(post_id)
+            channel_seen.add(post_id)
             save_seen(subreddit, seen)
             print(f"✓ [{subreddit}] Posted: {title[:70]}")
         else:
@@ -658,7 +673,7 @@ def process_entry(entry: dict, seen: set, sub: dict):
         print(f"✗ [{subreddit}] Failed {post_id}: {e}")
 
 # ───────────────────────── fetch (returns backoff seconds, or 0) ─────────────────────────
-def fetch_and_process(sub: dict, seen: set) -> float:
+def fetch_and_process(sub: dict, seen: set, channel_seen: set) -> float:
     """
     Fetch one subreddit's RSS feed and process new entries.
     Returns 0 on a normal fetch, or a number of seconds to additionally
@@ -698,7 +713,7 @@ def fetch_and_process(sub: dict, seen: set) -> float:
         print(f"RSS fetched for r/{subreddit}: {len(entries)} entries")
 
         for entry in reversed(entries):
-            process_entry(entry, seen, sub)
+            process_entry(entry, seen, channel_seen, sub)
             # Give the OS a chance to reclaim memory between posts instead
             # of decoding/uploading media back-to-back with no gap — this
             # is what turns transient per-post memory use into a spike big
@@ -749,6 +764,12 @@ def main():
     )
 
     seen = {s["name"]: load_seen(s["name"]) for s in SUBREDDITS}
+    # Union the persisted per-subreddit IDs for each Telegram destination. This
+    # also deduplicates posts shared by overlapping subreddit feeds after restart.
+    channel_seen: dict[str, set] = {}
+    for sub in SUBREDDITS:
+        channel_seen.setdefault(str(sub["chat_id"]), set()).update(seen[sub["name"]])
+
     # due_at: subreddit is eligible to be fetched once time.time() >= due_at.
     due_at = {s["name"]: 0.0 for s in SUBREDDITS}
 
@@ -762,7 +783,7 @@ def main():
             if now < due_at[name]:
                 continue
 
-            backoff = fetch_and_process(sub, seen[name])
+            backoff = fetch_and_process(sub, seen[name], channel_seen.setdefault(str(sub["chat_id"]), set()))
             now = time.time()
             due_at[name] = now + MIN_SECONDS_BETWEEN_FETCHES_PER_SUB + backoff
 
