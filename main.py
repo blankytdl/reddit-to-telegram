@@ -596,6 +596,7 @@ def extract_media_url(entry) -> str | None:
     return clean[0] if clean else None
 
 def process_entry(entry: dict, seen: set, sub: dict):
+    _mark_progress()
     subreddit = sub["name"]
     chat_id = sub["chat_id"]
 
@@ -638,6 +639,7 @@ def process_entry(entry: dict, seen: set, sub: dict):
                 text += f"\n\n{link}"
             delivered = send_message(chat_id, text)
 
+        _mark_progress()
         if delivered:
             seen.add(post_id)
             save_seen(subreddit, seen)
