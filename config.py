@@ -53,7 +53,7 @@ GITHUB_SEEN_PATH = os.environ.get("GITHUB_SEEN_PATH", "seen").strip("/")
 # per changed subreddit instead of committing after every single post,
 # which would spam the repo's history and burn through GitHub's API rate
 # limit for no benefit (only the latest state after a restart matters).
-GITHUB_SYNC_INTERVAL_SECONDS = int(os.environ.get("GITHUB_SYNC_INTERVAL_SECONDS", "300"))
+GITHUB_SYNC_INTERVAL_SECONDS = int(os.environ.get("GITHUB_SYNC_INTERVAL_SECONDS", "60"))
 
 if bool(GITHUB_TOKEN) != bool(GITHUB_REPO):
     raise RuntimeError(
