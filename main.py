@@ -539,7 +539,7 @@ def handle_reddit_video(chat_id: str, video_url: str, caption: str, spoiler: boo
         ]
 
         audio_ok = False
-        audio_deadline = time.monotonic() + 120
+        audio_deadline = time.monotonic() + 60
         for aurl in audio_candidates:
             if time.monotonic() >= audio_deadline:
                 print("  Audio track attempts stopped: 120s total budget reached")
@@ -549,7 +549,7 @@ def handle_reddit_video(chat_id: str, video_url: str, caption: str, spoiler: boo
                     os.remove(audio_path)
             except OSError:
                 pass
-            if download_to_file(aurl, audio_path, deadline_seconds=35) and os.path.getsize(audio_path) > 2000:
+            if download_to_file(aurl, audio_path, deadline_seconds=20) and os.path.getsize(audio_path) > 2000:
                 audio_ok = True
                 break
 
@@ -571,7 +571,7 @@ def handle_reddit_video(chat_id: str, video_url: str, caption: str, spoiler: boo
                     check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    timeout=180,
+                    timeout=90,
                 )
                 final = merged_path
             except Exception:
