@@ -309,12 +309,12 @@ mod tests {
         assert!(g[1].animated);
         let with_source = r#" [{"data":{"children":[{"data":{"gallery_data":{"items":[{"media_id":"source1"}]},
           "media_metadata":{"source1":{"status":"valid","e":"Image","m":"image/jpeg",
-          "s":{"u":"https://preview.redd.it/source1.jpeg?width=1200&amp;format=pjpg&amp;auto=webp&amp;s=signature"}}}}]}}]"#;
+          "s":{"u":"https://preview.redd.it/source1.jpeg?width=1200&amp;format=pjpg&amp;auto=webp&amp;s=signature"}}}}}]}}]"#;
         let source_gallery = parse_gallery(with_source).unwrap();
         assert_eq!(source_gallery[0].url, "https://preview.redd.it/source1.jpeg?width=1200&format=pjpg&auto=webp&s=signature");
         let untrusted_source = r#" [{"data":{"children":[{"data":{"gallery_data":{"items":[{"media_id":"source2"}]},
           "media_metadata":{"source2":{"status":"valid","e":"Image","m":"image/jpeg",
-          "s":{"u":"https://evil.example/image.jpg"}}}}]}}]"#;
+          "s":{"u":"https://evil.example/image.jpg"}}}}}]}}]"#;
         assert_eq!(parse_gallery(untrusted_source).unwrap()[0].url, "https://i.redd.it/source2.jpg");
         assert_eq!(g[2].url, "https://i.redd.it/ddd.png");
         assert!(parse_gallery("[]").is_err());
