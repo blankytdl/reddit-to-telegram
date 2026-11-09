@@ -8,9 +8,9 @@ RUN cargo build --release
 # ---- runtime stage (glibc, needed by the Lightpanda binary) ----
 FROM debian:bookworm-slim
 # Lightpanda is pinned: you MUST supply a release tag and its SHA-256 (see README).
-# On Render these are read from the service's environment variables at build time.
-ARG LIGHTPANDA_VERSION
-ARG LIGHTPANDA_SHA256
+# Pinned to the official Lightpanda 1.0.3 Linux x86_64 release.
+ARG LIGHTPANDA_VERSION=1.0.3
+ARG LIGHTPANDA_SHA256=53eb34da09159dcf8f04865dbfe3e63e9a652062684495aa7ced5ddd7c82e8b0
 ARG LIGHTPANDA_ASSET=lightpanda-x86_64-linux
 
 RUN apt-get update \
