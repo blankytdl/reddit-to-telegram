@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{bail, Result};
 use reqwest::Client;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -559,7 +559,15 @@ impl Scheduler {
     async fn process_group(&mut self, g: &Group, posts: Vec<Post>) {
         let chat = g.chat_id.as_str();
         let page_ok = !posts.is_empty();
-        let mut fresh: Vec<Post> = posts.into_iter().filter(|p| !self.is_seen(chat, &p.id)).collect();
+        // Remove duplicate cards returned within the same Reddit page as well as IDs
+        // already delivered in earlier cycles. This must happen before delivery because
+        // filtering only against SeenStore once would allow a repeated ID in this batch
+        // to be sent more than once if the first copy fails or succeeds.
+        let mut batch_ids = HashSet::new();
+        let mut fresh: Vec<Post> = posts
+            .into_iter()
+            .filter(|p| !self.is_seen(chat, &p.id) && batch_ids.insert(p.id.clone()))
+            .collect();
         fresh.reverse(); // oldest first
         if !fresh.is_empty() {
             info!(subs = %g.names.join("+"), new = fresh.len(), "processing");
