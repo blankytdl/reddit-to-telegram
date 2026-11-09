@@ -37,7 +37,7 @@ pub const EXTRACT_JS: &str = r#"(() => {
     });
   });
   const body = (document.body && document.body.textContent) || '';
-  return JSON.stringify({ title: document.title || '', text: body.slice(0, 400), posts: posts });
+  return JSON.stringify({ title: document.title || '', url: location.href || '', text: body.slice(0, 400), posts: posts });
 })()"#;
 
 /// Returns the raw page text (used to read a post's JSON document in the browser).
