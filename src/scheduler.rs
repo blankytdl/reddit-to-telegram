@@ -558,21 +558,42 @@ impl Scheduler {
 
     async fn process_group(&mut self, g: &Group, posts: Vec<Post>) {
         let chat = g.chat_id.as_str();
-        let page_ok = !posts.is_empty();
-        // Remove duplicate cards returned within the same Reddit page as well as IDs
-        // already delivered in earlier cycles. This must happen before delivery because
-        // filtering only against SeenStore once would allow a repeated ID in this batch
-        // to be sent more than once if the first copy fails or succeeds.
-        let mut batch_ids = HashSet::new();
-        let mut fresh: Vec<Post> = posts
+        let fetched = posts.len();
+        let page_ok = fetched > 0;
+        let mut per_sub = HashMap::<String, usize>::new();
+        for p in &posts {
+            let name = if p.subreddit.is_empty() { "(missing subreddit field)" } else { &p.subreddit };
+            *per_sub.entry(name.to_string()).or_insert(0) += 1;
+        }
+        let per_sub = per_sub
             .into_iter()
-            .filter(|p| !self.is_seen(chat, &p.id) && batch_ids.insert(p.id.clone()))
-            .collect();
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Remove duplicate cards returned within the same Reddit page as well as IDs
+        // already delivered in earlier cycles. Count both cases so the logs explain
+        // why a configured subreddit may not produce a Telegram message.
+        let mut batch_ids = HashSet::new();
+        let (mut duplicate_in_batch, mut already_seen) = (0u32, 0u32);
+        let mut fresh = Vec::with_capacity(fetched);
+        for p in posts {
+            if !batch_ids.insert(p.id.clone()) {
+                duplicate_in_batch += 1;
+            } else if self.is_seen(chat, &p.id) {
+                already_seen += 1;
+            } else {
+                fresh.push(p);
+            }
+        }
         fresh.reverse(); // oldest first
-        if !fresh.is_empty() {
-            info!(subs = %g.names.join("+"), new = fresh.len(), "processing");
+        let fresh_count = fresh.len() as u32;
+        if fresh_count > 0 {
+            info!(subs = %g.names.join("+"), new = fresh_count, "processing");
         }
         let (mut sent, mut seeded, mut skipped) = (0u32, 0u32, 0u32);
+        let (mut filtered_media_only, mut filtered_spoiler, mut duplicate_media, mut failed) =
+            (0u32, 0u32, 0u32, 0u32);
 
         for p in fresh {
             if self.token.is_cancelled() {
@@ -585,8 +606,15 @@ impl Scheduler {
                 seeded += 1;
                 continue;
             }
-            if (g.media_only && p.media == Media::None) || (p.spoiler && self.cfg.spoiler_mode == SpoilerMode::Skip) {
+            if g.media_only && p.media == Media::None {
                 self.mark_seen(chat, &p.id);
+                filtered_media_only += 1;
+                skipped += 1;
+                continue;
+            }
+            if p.spoiler && self.cfg.spoiler_mode == SpoilerMode::Skip {
+                self.mark_seen(chat, &p.id);
+                filtered_spoiler += 1;
                 skipped += 1;
                 continue;
             }
@@ -595,6 +623,7 @@ impl Scheduler {
                 if self.store.contains(k) {
                     debug!(post = %p.id, "same media already sent to this channel; skipping");
                     self.mark_seen(chat, &p.id);
+                    duplicate_media += 1;
                     skipped += 1;
                     continue;
                 }
@@ -614,6 +643,7 @@ impl Scheduler {
                     sent += 1;
                 }
                 Err(e) => {
+                    failed += 1;
                     if self.fail_counts.len() > 1000 {
                         self.fail_counts.clear();
                     }
@@ -632,9 +662,22 @@ impl Scheduler {
                 self.store.mark_sub(&sub_key(chat, name));
             }
         }
-        if sent + seeded + skipped > 0 {
-            info!(subs = %g.names.join("+"), sent, seeded, skipped, "group done");
-        }
+        info!(
+            subs = %g.names.join("+"),
+            fetched,
+            per_sub = %per_sub,
+            fresh = fresh_count,
+            already_seen,
+            duplicate_in_batch,
+            seeded,
+            filtered_media_only,
+            filtered_spoiler,
+            duplicate_media,
+            sent,
+            failed,
+            skipped,
+            "group processing summary"
+        );
     }
 }
 
