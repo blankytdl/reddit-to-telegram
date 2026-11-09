@@ -6,11 +6,6 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     envVars:
-      # Build-time pins for the browser (declared as ARG in the Dockerfile)
-      - key: LIGHTPANDA_VERSION
-        sync: false
-      - key: LIGHTPANDA_SHA256
-        sync: false
       # Secrets
       - key: TELEGRAM_BOT_TOKEN
         sync: false
