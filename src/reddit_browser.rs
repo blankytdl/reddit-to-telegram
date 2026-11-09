@@ -171,8 +171,9 @@ impl Browser {
     async fn fetch_script(&mut self, url: &str, script: &'static str) -> Result<String> {
         self.ensure().await?;
         let pt = self.s.page_timeout;
+        let session_cookie = self.s.reddit_session_cookie.clone();
         let cdp = self.cdp.as_mut().ok_or_else(|| anyhow!("no CDP connection"))?;
-        let r = timeout(pt, fetch_inner(cdp, url, pt, script)).await;
+        let r = timeout(pt, fetch_inner(cdp, url, pt, script, session_cookie.as_deref())).await;
         match r {
             Ok(Ok(s)) => Ok(s),
             Ok(Err(e)) => {
@@ -196,21 +197,41 @@ impl Browser {
     }
 }
 
-async fn fetch_inner(cdp: &mut Cdp, url: &str, pt: Duration, script: &str) -> Result<String> {
+async fn fetch_inner(cdp: &mut Cdp, url: &str, pt: Duration, script: &str, reddit_session_cookie: Option<&str>) -> Result<String> {
     let step = Duration::from_secs(30).min(pt);
     let r = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None, step).await?;
     let target = r["targetId"].as_str().ok_or_else(|| anyhow!("no targetId"))?.to_string();
-    let res = navigate_and_extract(cdp, &target, url, step, pt, script).await;
+    let res = navigate_and_extract(cdp, &target, url, step, pt, script, reddit_session_cookie).await;
     let _ = cdp.call("Target.closeTarget", json!({ "targetId": target }), None, Duration::from_secs(5)).await;
     cdp.events.clear();
     res
 }
 
-async fn navigate_and_extract(cdp: &mut Cdp, target: &str, url: &str, step: Duration, pt: Duration, script: &str) -> Result<String> {
+async fn navigate_and_extract(cdp: &mut Cdp, target: &str, url: &str, step: Duration, pt: Duration, script: &str, reddit_session_cookie: Option<&str>) -> Result<String> {
     let r = cdp.call("Target.attachToTarget", json!({ "targetId": target, "flatten": true }), None, step).await?;
     let sid = r["sessionId"].as_str().ok_or_else(|| anyhow!("no sessionId"))?.to_string();
     let s = Some(sid.as_str());
     cdp.call("Page.enable", json!({}), s, step).await?;
+    if let Some(cookie) = reddit_session_cookie {
+        cdp.call("Network.enable", json!({}), s, step).await?;
+        let result = cdp.call(
+            "Network.setCookie",
+            json!({
+                "name": "reddit_session",
+                "value": cookie,
+                "domain": ".reddit.com",
+                "path": "/",
+                "secure": true,
+                "httpOnly": true,
+                "sameSite": "Lax"
+            }),
+            s,
+            step,
+        ).await?;
+        if result.get("success").and_then(Value::as_bool) == Some(false) {
+            bail!("Lightpanda rejected REDDIT_SESSION_COOKIE");
+        }
+    }
     cdp.events.clear();
     let nav = cdp.call("Page.navigate", json!({ "url": url }), s, step).await?;
     if let Some(err) = nav.get("errorText").and_then(Value::as_str) {
