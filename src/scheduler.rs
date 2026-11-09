@@ -164,16 +164,9 @@ impl Deliverer {
             Media::Gif(u) => self.media(&c, u, FileKind::Animation).await,
             Media::Mp4(u) => self.media(&c, u, FileKind::Video).await,
             Media::RedditVideo(id) => self.reddit_video(&c, id).await,
-            Media::Gallery(_) => self.link(&c, Some("Gallery post; see original.")).await,
+            Media::Gallery(_) => bail!("gallery post reached media delivery without being resolved"),
             Media::None => self.link(&c, None).await,
         }
-    }
-
-    /// Text-only fallback used when a gallery could not be resolved.
-    pub async fn deliver_link(&self, chat: &str, p: &Post, note: &str) -> Result<()> {
-        let spoiler = p.spoiler && self.cfg.spoiler_mode == SpoilerMode::Mark;
-        let c = Ctx { chat, p, cap: caption(p, spoiler, self.cfg.caption), spoiler, media_only: false };
-        self.link(&c, Some(note)).await
     }
 
     async fn fetch_photo(&self, url: &str) -> Option<(md::TempFile, u64)> {
@@ -342,13 +335,10 @@ impl Deliverer {
                 self.upload(c, tf.path(), size, kind).await // tf dropped -> temp file removed
             }
             Err(e) => {
-                let big = md::is_too_large(&e);
-                warn!(post = %c.p.id, reason = %e, "media could not be sent as a file");
-                if c.media_only && !big {
-                    return Err(e); // retried next cycle, dropped after 3 failures
-                }
-                let note = if big { "Media too large for Telegram upload; see original post." } else { "Media could not be downloaded; see original post." };
-                self.link(c, Some(note)).await
+                // Never replace failed media with a Reddit link. Return the failure so the
+                // scheduler can retry it and then skip it without blocking later posts.
+                warn!(post = %c.p.id, reason = %e, "media could not be sent; no link fallback");
+                Err(e)
             }
         }
     }
@@ -358,17 +348,14 @@ impl Deliverer {
             Ok(tf) => {
                 let size = tf.size().await;
                 if size > self.cfg.max_upload_bytes {
-                    warn!(post = %c.p.id, size, "video exceeds upload limit; sending link");
-                    return self.link(c, Some("Video too large for Telegram upload; see original post.")).await;
+                    warn!(post = %c.p.id, size, "video exceeds upload limit; skipping media");
+                    bail!("video exceeds Telegram upload limit");
                 }
                 self.upload(c, tf.path(), size, FileKind::Video).await
             }
             Err(e) => {
                 warn!(post = %c.p.id, reason = %e, "reddit video could not be fetched");
-                if c.media_only {
-                    return Err(e);
-                }
-                self.link(c, Some("Video could not be fetched; see original post.")).await
+                Err(e)
             }
         }
     }
@@ -542,7 +529,7 @@ impl Scheduler {
     }
 
     /// Loads the post's JSON in the browser (one extra page load) to learn the gallery's images.
-    async fn deliver_gallery_post(&mut self, chat: &str, p: &Post, id: &str, media_only: bool) -> Result<()> {
+    async fn deliver_gallery_post(&mut self, chat: &str, p: &Post, id: &str) -> Result<()> {
         sleep(self.cfg.request_gap).await;
         let url = format!("{}/comments/{}.json?raw_json=1", self.cfg.reddit_base, id);
         let items = match self.browser.fetch_text(&url).await {
@@ -552,10 +539,9 @@ impl Scheduler {
         };
         match items {
             Ok(items) => self.deliverer.deliver_gallery(chat, p, &items).await,
-            Err(e) if media_only => Err(e),
             Err(e) => {
-                warn!(post = %p.id, "gallery could not be resolved: {e:#}");
-                self.deliverer.deliver_link(chat, p, "Gallery could not be loaded; see original post.").await
+                warn!(post = %p.id, "gallery could not be resolved; no link fallback: {e:#}");
+                Err(e)
             }
         }
     }
@@ -606,7 +592,7 @@ impl Scheduler {
                 }
             }
             let result = match &p.media {
-                Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id, g.media_only).await,
+                Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id).await,
                 _ => self.deliverer.deliver(chat, &p, g.media_only).await,
             };
             match result {
