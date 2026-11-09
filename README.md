@@ -89,8 +89,11 @@ readable text, and whether Reddit rate-limits these extra loads.
   MP4 / v.redd.it → `sendVideo`. Over 50 MB or undownloadable → a link message. Galleries, text posts and
   other hosts are sent as links. Downloads only from `i.redd.it`, `preview.redd.it`, `v.redd.it`, `i.imgur.com` over https.
 - Reddit video: tries `DASH_1080…240` and `DASH_AUDIO_*` by HEAD probing (not parsing the MPD). Untested against live Reddit.
-- Reddit blocks/CAPTCHAs/logins are reported and skipped. **There is no bypass logic.** Lightpanda sends its own User-Agent;
-  it is not spoofed.
+- Reddit blocks/CAPTCHAs/login walls are reported and skipped with backoff. Old Reddit now requires a logged-in session.
+  For the Lightpanda browser flow, set `REDDIT_SESSION_COOKIE` in the host's secret environment variables to the value
+  of the `reddit_session` cookie from an account that can access Old Reddit. Never put the cookie in this file, a commit,
+  or a chat message. The cookie is a login credential and may expire; replace it in the host settings if access stops.
+  The bot does not bypass CAPTCHA or other access controls. Lightpanda sends its own User-Agent; it is not spoofed.
 
 ## Deploy on Render
 1. Lightpanda is pinned in `Dockerfile` to the official `1.0.3` Linux x86_64 release, with its published SHA-256. No
@@ -99,8 +102,9 @@ readable text, and whether Reddit rate-limits these extra loads.
 2. In the repo: `cargo generate-lockfile` and commit `Cargo.lock` (pins dependencies). Then remove nothing else; `Cargo.toml` uses semver ranges.
 3. Create a GitHub fine-grained token with **Contents: read/write** on one repo (can be private). No need to create the branch; the bot does.
 4. Render → New → Blueprint (uses `render.yaml`), or configure the existing service to use Docker with `./Dockerfile` at
-   the repository root. Set the runtime env vars from `.env.example`; do not add `LIGHTPANDA_VERSION` or
-   `LIGHTPANDA_SHA256` as service variables because the Dockerfile already pins them.
+   the repository root. Set the runtime env vars from `.env.example`. For Old Reddit, also add `REDDIT_SESSION_COOKIE`
+   as a secret environment variable (the `reddit_session` cookie value from your own logged-in account). Do not add
+   `LIGHTPANDA_VERSION` or `LIGHTPANDA_SHA256`; the Dockerfile already pins them.
 5. Add your bot as admin of each target channel.
 6. Check logs for `first run: existing posts marked seen`, then new posts on the next cycle.
 
