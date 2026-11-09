@@ -32,6 +32,8 @@ struct RawPage {
     #[serde(default)]
     text: String,
     #[serde(default)]
+    url: String,
+    #[serde(default)]
     posts: Vec<RawPost>,
 }
 
@@ -171,8 +173,15 @@ pub fn parse_gallery(json: &str) -> Result<Vec<GalleryItem>> {
 pub fn parse_page(json: &str, limit: usize) -> Result<PageStatus> {
     let page: RawPage = serde_json::from_str(json).context("extraction JSON was not valid")?;
     let haystack = format!("{} {}", page.title, page.text).to_ascii_lowercase();
+    let page_url = page.url.to_ascii_lowercase();
 
     if page.posts.is_empty() {
+        if page_url.contains("/login/")
+            || haystack.contains("log in to use old reddit")
+            || haystack.contains("accounts are required to access old reddit")
+        {
+            return Ok(PageStatus::Blocked("old Reddit login wall (reason=lor2)".into()));
+        }
         if haystack.contains("too many requests") {
             return Ok(PageStatus::RateLimited);
         }
@@ -296,7 +305,9 @@ mod tests {
         assert!(matches!(parse_page(rl, 5).unwrap(), PageStatus::RateLimited));
         let bl = r#"{"title":"blocked","text":"whoa there, pardner!","posts":[]}"#;
         assert!(matches!(parse_page(bl, 5).unwrap(), PageStatus::Blocked(_)));
-        let empty = r#"{"title":"x","text":"","posts":[]}"#;
+        let old_reddit_login = r#"{"title":"Log in to use Old Reddit","text":"Accounts are required to access old Reddit.","url":"https://old.reddit.com/login/?reason=lor2&dest=%2Fr%2Fanime%2Fnew%2F","posts":[]}"#;
+        assert!(matches!(parse_page(old_reddit_login, 5).unwrap(), PageStatus::Blocked(reason) if reason.contains("login wall")));
+        let empty = r#"{"title":"x","text":"","url":"https://old.reddit.com/r/anime/new/","posts":[]}"#;
         assert!(matches!(parse_page(empty, 5).unwrap(), PageStatus::Ok(v) if v.is_empty()));
         assert!(parse_page("not json", 5).is_err());
     }
