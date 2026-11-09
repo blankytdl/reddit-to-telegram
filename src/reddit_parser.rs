@@ -139,6 +139,20 @@ pub struct GalleryItem {
 
 /// Parses the post JSON (`/comments/<id>.json`) of a gallery post into ordered image URLs.
 /// URLs are rebuilt as https://i.redd.it/<media_id>.<ext> (no signed preview URLs needed).
+/// Accept only Reddit image hosts from gallery metadata. Reddit's JSON can HTML-escape
+/// ampersands in signed preview URLs; decode those before passing the URL to reqwest.
+fn gallery_source_url(raw: &str) -> Option<String> {
+    let url = raw.replace("&amp;", "&");
+    [
+        "https://i.redd.it/",
+        "https://preview.redd.it/",
+        "https://external-preview.redd.it/",
+    ]
+    .iter()
+    .any(|prefix| url.starts_with(prefix))
+    .then_some(url)
+}
+
 pub fn parse_gallery(json: &str) -> Result<Vec<GalleryItem>> {
     let v: serde_json::Value = serde_json::from_str(json.trim()).context("gallery data was not valid JSON")?;
     let d = &v[0]["data"]["children"][0]["data"];
@@ -162,7 +176,19 @@ pub fn parse_gallery(json: &str) -> Result<Vec<GalleryItem>> {
             _ => continue,
         };
         let animated = ext == "gif" || m["e"].as_str() == Some("AnimatedImage");
-        out.push(GalleryItem { url: format!("https://i.redd.it/{id}.{ext}"), animated });
+        // Prefer Reddit's actual source URL (which may use .jpeg rather than .jpg, or
+        // include a required signed query string). Keep the ID-based URL as a fallback
+        // for older metadata that does not provide a usable source URL.
+        let fallback = format!("https://i.redd.it/{id}.{ext}");
+        let url = if animated {
+            fallback
+        } else {
+            m["s"]["u"]
+                .as_str()
+                .and_then(gallery_source_url)
+                .unwrap_or(fallback)
+        };
+        out.push(GalleryItem { url, animated });
     }
     if out.is_empty() {
         bail!("gallery contained no usable images");
@@ -281,6 +307,15 @@ mod tests {
         assert_eq!(g.len(), 3);
         assert_eq!(g[0], GalleryItem { url: "https://i.redd.it/aaa.jpg".into(), animated: false });
         assert!(g[1].animated);
+        let with_source = r#" [{"data":{"children":[{"data":{"gallery_data":{"items":[{"media_id":"source1"}]},
+          "media_metadata":{"source1":{"status":"valid","e":"Image","m":"image/jpeg",
+          "s":{"u":"https://preview.redd.it/source1.jpeg?width=1200&amp;format=pjpg&amp;auto=webp&amp;s=signature"}}}}]}}]"#;
+        let source_gallery = parse_gallery(with_source).unwrap();
+        assert_eq!(source_gallery[0].url, "https://preview.redd.it/source1.jpeg?width=1200&format=pjpg&auto=webp&s=signature");
+        let untrusted_source = r#" [{"data":{"children":[{"data":{"gallery_data":{"items":[{"media_id":"source2"}]},
+          "media_metadata":{"source2":{"status":"valid","e":"Image","m":"image/jpeg",
+          "s":{"u":"https://evil.example/image.jpg"}}}}]}}]"#;
+        assert_eq!(parse_gallery(untrusted_source).unwrap()[0].url, "https://i.redd.it/source2.jpg");
         assert_eq!(g[2].url, "https://i.redd.it/ddd.png");
         assert!(parse_gallery("[]").is_err());
         assert!(parse_gallery("<html>").is_err());
