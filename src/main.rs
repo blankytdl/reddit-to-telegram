@@ -55,7 +55,18 @@ async fn wait_signal() {
 
 async fn run() -> Result<()> {
     let cfg = Arc::new(Config::from_env(true)?);
-    info!(subs = cfg.subs.len(), page_loads_per_cycle = cfg.groups.len(), interval_secs = cfg.interval.as_secs(), limit = cfg.post_limit, "starting");
+    let configured_subreddits = cfg.subs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(",");
+    let configured_groups = cfg.groups.iter().map(|g| g.names.join("+")).collect::<Vec<_>>().join(" | ");
+    info!(
+        subs = cfg.subs.len(),
+        subreddits = %configured_subreddits,
+        groups = %configured_groups,
+        page_loads_per_cycle = cfg.groups.len(),
+        media_only = cfg.subs.iter().all(|s| s.media_only),
+        interval_secs = cfg.interval.as_secs(),
+        limit = cfg.post_limit,
+        "starting"
+    );
     let http = http_client()?;
     let token = CancellationToken::new();
     let health = Arc::new(health::Health::new());
