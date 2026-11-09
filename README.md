@@ -1,154 +1,126 @@
-# Reddit → Telegram Bot
+# Reddit → Telegram bot (Rust, Lightpanda, Render Free)
 
-Polls one or more subreddits via their public RSS feeds (no Reddit API / OAuth
-needed) and posts new entries — images, GIFs, and videos — into Telegram
-channels. One bot can feed any number of subreddits into any number of
-channels, including several subreddits into the same channel.
+Replacement for the RSS-based bot. It drives a real headless browser (Lightpanda, one persistent
+process, one page at a time) to read `old.reddit.com` listings, then forwards posts and media to
+Telegram via the Bot API.
 
-Built to run as a free Render Web Service, with an optional GitHub-backed
-backup of "seen post" state so a redeploy or restart doesn't cause reposts.
+> **STATUS: written but NOT compiled or tested.** It was authored in a sandbox with no Rust toolchain
+> and no network access. Nothing below has been run against Reddit, Telegram, GitHub or Render. Run
+> `scripts/verify.sh` and fill in `docs/COMPATIBILITY_AND_RESOURCES.md` before trusting it.
+> Expect to fix a few compile errors on first `cargo build`.
+
+Your existing Python implementation is untouched: this lives in its own directory.
 
 ## How it works
+- `reddit_browser.rs` – spawns `lightpanda serve`, talks CDP over WebSocket, opens one target, navigates,
+  runs an extraction script in the page, closes the target. Browser is recycled every `BROWSER_RECYCLE_CYCLES` cycles
+  and restarted on any error/timeout.
+- `reddit_parser.rs` – JSON → posts; detects "Too Many Requests"/block pages (heuristic); classifies media.
+- `media_downloader.rs` – streaming, size-capped downloads to temp files (deleted on drop); Reddit DASH
+  video+audio are remuxed with `ffmpeg -c copy` (no re-encode).
+- `telegram.rs` – direct Bot API, streamed multipart uploads, retry on 429 (`retry_after`) / 5xx.
+- `seen_store.rs` – seen IDs in memory, local JSON file, GitHub Contents API backup on branch `bot-state`.
+- `scheduler.rs` – sequential cycle every 15 min, exponential backoff on rate limit, per-post failure cap.
+- `health.rs`, `self_ping.rs` – `/health` (200/503) and optional best-effort self-ping.
 
-- Each subreddit is polled in a fixed round-robin order, one at a time, with
-  a delay between subreddits and a minimum interval between two fetches of
-  the *same* subreddit (Reddit's public RSS throttles to roughly one request
-  per minute per feed).
-- New posts are sent to their configured Telegram channel as a photo, GIF
-  (animation), or video, with an optional caption (title / footer / link
-  back to Reddit).
-- Text-only posts (link posts, self-text posts with no media) can be skipped
-  entirely or sent as plain text messages — your choice.
-- A lightweight heuristic blurs posts that look spoiler-tagged, using
-  Telegram's native spoiler feature.
-- Already-sent posts are tracked per subreddit in local `seen/*.json` files
-  so they aren't resent. On Render's free tier there's no persistent disk,
-  so this state is wiped on every deploy/restart — see the optional GitHub
-  backup below if you want it to survive that.
-- A small HTTP server plus a self-ping loop keep the free Render instance
-  from spinning down from inactivity.
+SQLite was deliberately not used: a small JSON file plus the GitHub copy is simpler and avoids a C build dependency.
 
-## Requirements
-
-- Python 3 with the packages in `requirements.txt` (`requests`, `feedparser`,
-  `imageio-ffmpeg`, `Pillow`).
-- A Telegram bot token from [@BotFather](https://t.me/BotFather).
-- The bot added as an **admin** to every Telegram channel it will post to.
-
-## Environment variables
-
-All configuration is done through environment variables — no code edits
-needed. Set these in Render's dashboard under the service's **Environment**
-tab (or in a local `.env` if you run it yourself).
-
-### Required
-
-| Variable | Description |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Your bot's token from @BotFather. |
-| `SUBREDDIT_1_NAME` | First subreddit to poll, without the `r/` prefix (e.g. `aww`). |
-| `SUBREDDIT_1_CHAT_ID` | Telegram channel to post it to — `@channel_username` or a numeric chat id. |
-
-### Adding more subreddits
-
-Add another numbered pair for each additional subreddit — `SUBREDDIT_2_*`,
-`SUBREDDIT_3_*`, and so on. The bot keeps reading increasing numbers until it
-hits one with no `_NAME` set, so there's no fixed limit — just add or remove
-env vars to change the list.
-
-| Variable | Description | Default |
-|---|---|---|
-| `SUBREDDIT_<N>_NAME` | Subreddit name for entry N. | — (required per entry) |
-| `SUBREDDIT_<N>_CHAT_ID` | Telegram channel for entry N. | — (required per entry) |
-| `SUBREDDIT_<N>_SORT` | `new` or `hot`. | `SUBREDDIT_DEFAULT_SORT`, or `new` |
-| `SUBREDDIT_<N>_LIMIT` | How many latest posts to look at per fetch. | `SUBREDDIT_DEFAULT_LIMIT`, or `12` |
-| `SUBREDDIT_DEFAULT_SORT` | Fallback sort for any entry that doesn't set its own. | `new` |
-| `SUBREDDIT_DEFAULT_LIMIT` | Fallback limit for any entry that doesn't set its own. | `12` |
-
-**Multiple subreddits into one channel:** just give two `SUBREDDIT_<N>_CHAT_ID`
-entries the same value, e.g.:
-
+## New options (anime-channel setup)
 ```
-SUBREDDIT_1_NAME=aww
-SUBREDDIT_1_CHAT_ID=@my_animals_channel
-SUBREDDIT_2_NAME=AnimalsBeingDerps
-SUBREDDIT_2_CHAT_ID=@my_animals_channel
+DEFAULT_CHAT_ID=@animechannel
+SUBREDDITS=anime,manga,animememes,AnimeART     # many subs -> one channel
+MEDIA_ONLY=true                                 # only images / GIFs / videos
+SPOILER_MODE=mark                               # mark | skip | ignore
 ```
+- **Many subs, one channel:** `SUBREDDITS` (comma list; `name=@chat` overrides the channel) and/or numbered
+  `SUBREDDIT_n_*` vars. Subs with the same channel/sort/media-only settings are fetched in **one page load** via
+  `r/a+b+c` (`GROUP_MAX_SUBS`, default 8), so 30 subs ≈ 4 page loads instead of 30. If a combined page comes back empty
+  the bot retries each sub separately. The same image/video posted in several subs is sent to a channel once (`DEDUPE_MEDIA`).
+- **Media only:** `MEDIA_ONLY=true` (global) or `SUBREDDIT_n_MEDIA_ONLY` (per sub) drops text/link/gallery posts.
+- **Spoilers:** posts flagged as spoilers are sent with Telegram's spoiler overlay (`has_spoiler`) and the title in a
+  spoiler tag; `skip` drops them, `ignore` treats them normally. Detection = old.reddit's spoiler stamp/flair or a
+  `[spoiler]` tag in the title — selectors are **unverified** against live Reddit. Documents (oversized images) cannot be overlaid.
+- **Subreddit limit:** default cap 100 (`MAX_SUBREDDITS`, max 500). Memory does not grow with the sub count (sequential,
+  streamed); *time* does. No safe maximum has been measured. Instead the scheduler enforces a per-cycle time budget
+  (`CYCLE_BUDGET_SECS`, default 80% of the interval): when it runs out it stops and continues round-robin next cycle, and logs a warning
+  ("remaining groups run next cycle"). If you see that warning, raise `POLL_INTERVAL_SECS` or trim subs.
+- Telegram sends to one channel are spaced by `SEND_GAP_MS` (3 s) to stay under ~20 messages/minute; a busy 30-sub channel
+  may therefore lag. State is pushed to GitHub at most every `STATE_FLUSH_MIN_SECS` plus at the end of each cycle and on shutdown.
 
-Each subreddit still gets its own independent "seen" tracking and fetch
-schedule — they just happen to both post into the same channel.
+## Migrating from the Python bot (reference repo)
+- **Env vars carry over unchanged:** `TELEGRAM_BOT_TOKEN`, `SUBREDDIT_<N>_NAME/_CHAT_ID/_SORT/_LIMIT`, `SUBREDDIT_DEFAULT_SORT/_LIMIT`
+  (default limit 12), `SKIP_TEXT_ONLY_POSTS` (default `true`, = `MEDIA_ONLY`), `BLUR_SPOILERS`, `GITHUB_TOKEN/_REPO/_STATE_BRANCH`,
+  `GITHUB_SEEN_PATH`, `GITHUB_SYNC_INTERVAL_SECONDS` (default 60), `MAX_MEDIA_DOWNLOAD_BYTES`, plus `INCLUDE_TITLE/_FOOTER/_REDDIT_LINK`
+  (these three were hardcoded in `config.py`; now env vars). Per-sub `_LIMIT` is honoured; grouped subs load `sum(limits)` posts (max 100).
+- **Old state is imported.** On the first start with no `seen_posts.json` on the state branch, the bot reads the old
+  `seen/<sub>.json` files (`GITHUB_SEEN_PATH`) from the same branch, so nothing already posted is sent again; those subs also skip first-run seeding.
+- **Same caption layout:** title / `r/sub • u/author` / "Open on Reddit" link. Spoiler detection keeps the Python heuristics
+  (title `[spoiler`/`(spoiler)`, flair) plus old.reddit's spoiler stamp. Seen-tracking is per destination channel, like `channel_seen`.
+- **Tall/wide images** are padded with white to stay under Telegram's 20:1 limit (as the Pillow code did), via `ffmpeg`.
+- **Intentional differences:** it reads old.reddit through a real browser instead of RSS; polls every 15 min (your spec) instead of each sub every ≥75 s;
+  Lightpanda's own User-Agent is used (the Python bot sent a Chrome UA); audio is stream-copied instead of re-encoded to AAC.
+- **Two bugs in the reference `main.py` as uploaded:** `extract_media_url` has `matches = re.findall(...)        for m in matches:` on one line
+  (a SyntaxError, so that file won't start), and the Reddit-link fallback appends a literal `\n\n` (escaped backslashes) instead of newlines. Not carried over.
 
-### Post filtering & captions
+## Images as native Telegram photos
+Images are sent with `sendPhoto`. If an image is over 10 MB, or Telegram rejects it (dimensions), it is downscaled once with
+`ffmpeg` (longest side `PHOTO_MAX_DIM`, default 2560 px, JPEG, one image at a time) and still sent as a photo. Only if that is
+impossible — undecodable file or >50 megapixels (refused to protect the 512 MB limit) —
+is the original sent as a document. Very tall or wide strips are padded with white (ratio ≤19:1) instead of being rejected. Notes: a resized PNG loses transparency (flattened JPEG); resizing is the only image
+processing in the bot and costs a few CPU-seconds at 0.1 CPU, only for oversized images. Untested.
 
-| Variable | Description | Default |
-|---|---|---|
-| `SKIP_TEXT_ONLY_POSTS` | `true`/`false` — skip link/self-text posts with no media entirely, instead of sending them as a plain text message. | `true` |
+## Reddit galleries
+Gallery posts (`reddit.com/gallery/<id>`) are sent as photo **albums**, in gallery order, 10 per album (galleries of 11–20 images
+become two albums); the title/caption sits on the first album. To learn the image list the bot opens the post's
+`/comments/<id>.json` document **in the same browser** (one extra page load per gallery post — still browser-based, but it is
+Reddit's unofficial JSON view, not an API client; it is a separate step you may want to know about). Image URLs are rebuilt as
+`i.redd.it/<media_id>.<ext>`. Oversized images are resized like normal photos; animated items are sent as separate animations
+after the album. If the gallery can't be resolved the bot sends a link (or retries, in media-only mode). If an album fails after
+an earlier one was sent, the post is still marked done to avoid re-sending. Untested: whether Lightpanda renders that JSON view as
+readable text, and whether Reddit rate-limits these extra loads.
 
-`INCLUDE_TITLE`, `INCLUDE_FOOTER`, `INCLUDE_REDDIT_LINK`, and `BLUR_SPOILERS`
-are set directly in `config.py` (not yet exposed as env vars) if you want to
-change caption content or spoiler blurring.
+## Behaviour you should know
+- **First run seeds, doesn't flood.** For each subreddit+channel with no history, existing posts are recorded as seen and
+  *not* sent (`SEND_BACKLOG_ON_FIRST_RUN=true` to change).
+- If GitHub is configured and the restore fails after 5 tries, the bot **exits** instead of starting with empty
+  history (prevents duplicate floods). Render will restart it.
+- Posts are marked seen only after successful delivery; a post failing 3 cycles in a row is skipped.
+- Media: photo → `sendPhoto` (oversized/rejected → resized, still a photo; document only as last resort); GIF → `sendAnimation`;
+  MP4 / v.redd.it → `sendVideo`. Over 50 MB or undownloadable → a link message. Galleries, text posts and
+  other hosts are sent as links. Downloads only from `i.redd.it`, `preview.redd.it`, `v.redd.it`, `i.imgur.com` over https.
+- Reddit video: tries `DASH_1080…240` and `DASH_AUDIO_*` by HEAD probing (not parsing the MPD). Untested against live Reddit.
+- Reddit blocks/CAPTCHAs/logins are reported and skipped. **There is no bypass logic.** Lightpanda sends its own User-Agent;
+  it is not spoofed.
 
-### Optional: GitHub-backed "seen" state backup
+## Deploy on Render
+1. Pick a Lightpanda release from https://github.com/lightpanda-io/browser/releases. Download the Linux x86_64 asset,
+   run `sha256sum` on it, note the tag. (The asset name in the Dockerfile, `lightpanda-x86_64-linux`, is from memory — check it,
+   override with the `LIGHTPANDA_ASSET` build arg if different.)
+2. In the repo: `cargo generate-lockfile` and commit `Cargo.lock` (pins dependencies). Then remove nothing else; `Cargo.toml` uses semver ranges.
+3. Create a GitHub fine-grained token with **Contents: read/write** on one repo (can be private). No need to create the branch; the bot does.
+4. Render → New → Blueprint (uses `render.yaml`), or New Web Service → Docker. Set the env vars from `.env.example`,
+   including `LIGHTPANDA_VERSION` and `LIGHTPANDA_SHA256` (used as Docker build args — the build fails with a clear message if missing).
+5. Add your bot as admin of each target channel.
+6. Check logs for `first run: existing posts marked seen`, then new posts on the next cycle.
 
-Render's free plan has no persistent disk, so local `seen/*.json` files are
-wiped on every deploy/restart. This optional feature backs them up into your
-bot's own GitHub repo on a dedicated branch, so state survives redeploys.
-Leave both unset to disable it (the bot behaves exactly as before).
+Never commit `.env`. Tokens are never logged (Telegram URLs are stripped from errors).
 
-| Variable | Description | Default |
-|---|---|---|
-| `GITHUB_TOKEN` | Fine-grained GitHub PAT, scoped to this repo only, with Contents: Read and write. | — |
-| `GITHUB_REPO` | `"your-username/your-repo-name"`. | — |
-| `GITHUB_STATE_BRANCH` | Branch the bot commits "seen" state to. **Must not** be the branch Render deploys from — otherwise every state commit triggers a redeploy loop. | `bot-state` |
-| `GITHUB_SEEN_PATH` | Path within that branch where seen files are stored. | `seen` |
-| `GITHUB_SYNC_INTERVAL_SECONDS` | How often to push changed seen files to GitHub. | `300` |
+## Testing
+```
+cargo test                      # unit tests: config, parser, store, health, caption, backoff
+scripts/verify.sh               # real browser/Reddit/Telegram/restart/self-ping + RSS/CPU measurements
+docker run --cpus=0.1 --memory=512m ...   # approximate Render Free limits locally
+```
+Subcommands: `reddit-telegram-bot fetch-test <sub> [new|hot]` (browser + parser only), `media-test <chat_id> <url>`.
 
-Setup:
-1. Create a GitHub fine-grained personal access token scoped to only this
-   repository, with "Contents" permission set to Read and write (GitHub →
-   Settings → Developer settings → Fine-grained tokens).
-2. Set `GITHUB_TOKEN` to that token's value and `GITHUB_REPO` to
-   `"your-username/your-repo-name"`.
-3. Leave `GITHUB_STATE_BRANCH` on its default (`bot-state`) — the bot creates
-   that branch itself on first run if it doesn't exist.
-4. Keep Render's service pointed at your normal branch (e.g. `main`) so the
-   state commits never trigger a redeploy.
-
-You must set both `GITHUB_TOKEN` and `GITHUB_REPO` together, or leave both
-unset — setting only one raises a startup error.
-
-## Deploying to Render
-
-`render.yaml` is a [Render Blueprint](https://render.com/docs/blueprint-spec)
-that defines the service as a free-tier Python web service. To deploy:
-
-1. Push this project to a GitHub repo.
-2. In Render, create a new **Blueprint** and point it at that repo.
-3. Fill in the required environment variables in the Render dashboard
-   (`TELEGRAM_BOT_TOKEN`, `SUBREDDIT_1_NAME`, `SUBREDDIT_1_CHAT_ID`, etc.) —
-   `render.yaml` scaffolds the keys but leaves secret/site-specific values
-   blank for you to fill in.
-4. Deploy. Render sets `PORT` and `RENDER_EXTERNAL_URL` automatically;
-   `main.py` uses both for its health-check server and self-ping loop.
-
-### Staying awake on the free tier
-
-`main.py` runs a background thread that pings its own
-`RENDER_EXTERNAL_URL` every 10 minutes, which counts as inbound traffic and
-resets Render's ~15-minute idle-spindown timer — no external cron/uptime
-service needed. Caveat: this only works once the instance is already awake
-and that loop is running. If Render does spin it down (e.g. a slow cold
-start after a deploy pushes past 15 minutes before the loop starts pinging),
-nothing wakes it back up until an actual visitor (or you) hits the URL. For a
-true always-on guarantee, use an external pinger or Render's paid Background
-Worker plan instead.
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `main.py` | Polling loop, RSS parsing, media handling, health server, self-pinger. |
-| `config.py` | All configuration, read from environment variables. |
-| `telegram_sender.py` | Telegram Bot API calls (send photo/video/animation/message). |
-| `requirements.txt` | Python dependencies. |
-| `render.yaml` | Render Blueprint — service definition and env var scaffolding. |
+## Honest limitations
+- Render Free spins down after ~15 min without inbound traffic. Self-pinging the public URL only helps while the instance is
+  running; it cannot wake a stopped one. If it spins down, polling stops until something external hits the URL
+  (e.g. an uptime monitor) — and 750 free hours/month is ~31 days × 24 h = 744 h for ONE always-on service.
+- Render deploys can briefly run two instances; with a shared GitHub state file that can cause duplicates or a last-write-wins overwrite.
+- Filesystem is ephemeral; only the GitHub branch survives restarts. Crash between sending and flushing can re-send ≤1 subreddit's posts.
+- Reddit may block Render's datacenter IPs or Lightpanda's client. The compatibility of Lightpanda with `old.reddit.com` is unknown until you run `fetch-test`.
+- `old.reddit.com` markup selectors (`#siteTable > div.thing`, `data-*`) are assumed from memory of the site.
+- Lightpanda is AGPL-3.0; running it as an unmodified separate process for a private bot is generally fine, but check against your own use.
+- Obscura and Moli were **not evaluated** (could not verify they exist/are maintained from this environment).
+- At 0.1 CPU, page loads will be slow; `PAGE_TIMEOUT_SECS` defaults to 90 s. Measure it.

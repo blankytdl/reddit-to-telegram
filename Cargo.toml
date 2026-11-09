@@ -1,0 +1,26 @@
+[package]
+name = "reddit-telegram-bot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+# NOTE: run `cargo generate-lockfile` once and COMMIT Cargo.lock so builds are pinned.
+[dependencies]
+anyhow = "1"
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "json"] }
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "time", "fs", "io-util", "process", "signal", "sync", "net"] }
+tokio-tungstenite = "0.24"
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 4
+strip = true
