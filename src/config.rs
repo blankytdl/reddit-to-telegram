@@ -98,12 +98,14 @@ pub fn build_groups(subs: &[SubConfig], enabled: bool, max: usize) -> Vec<Group>
     groups
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BrowserSettings {
     pub bin: String,
     pub port: u16,
     pub extra_args: Vec<String>,
     pub page_timeout: Duration,
+    /// Optional Reddit login cookie. Treat like a password; never log or commit it.
+    pub reddit_session_cookie: Option<String>,
 }
 
 #[derive(Clone)]
@@ -227,6 +229,9 @@ impl BrowserSettings {
                 .map(|v| v.split_whitespace().map(String::from).collect())
                 .unwrap_or_default(),
             page_timeout: Duration::from_secs(num(get, "PAGE_TIMEOUT_SECS", 90u64)?),
+            reddit_session_cookie: get("REDDIT_SESSION_COOKIE")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         })
     }
 }
