@@ -20,6 +20,9 @@ services:
         sync: false
       - key: SUBREDDITS
         sync: false
+      # Optional login cookie for Old Reddit (store as a secret; never commit the value)
+      - key: REDDIT_SESSION_COOKIE
+        sync: false
       # Tuning (all optional)
       - key: SORT
         value: new
