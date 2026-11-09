@@ -93,13 +93,14 @@ readable text, and whether Reddit rate-limits these extra loads.
   it is not spoofed.
 
 ## Deploy on Render
-1. Pick a Lightpanda release from https://github.com/lightpanda-io/browser/releases. Download the Linux x86_64 asset,
-   run `sha256sum` on it, note the tag. (The asset name in the Dockerfile, `lightpanda-x86_64-linux`, is from memory — check it,
-   override with the `LIGHTPANDA_ASSET` build arg if different.)
+1. Lightpanda is pinned in `Dockerfile` to the official `1.0.3` Linux x86_64 release, with its published SHA-256. No
+   Lightpanda build variables need to be entered in Render. To upgrade it, verify the Linux x86_64 asset and digest at
+   https://github.com/lightpanda-io/browser/releases, then update the two `ARG` defaults in `Dockerfile`.
 2. In the repo: `cargo generate-lockfile` and commit `Cargo.lock` (pins dependencies). Then remove nothing else; `Cargo.toml` uses semver ranges.
 3. Create a GitHub fine-grained token with **Contents: read/write** on one repo (can be private). No need to create the branch; the bot does.
-4. Render → New → Blueprint (uses `render.yaml`), or New Web Service → Docker. Set the env vars from `.env.example`,
-   including `LIGHTPANDA_VERSION` and `LIGHTPANDA_SHA256` (used as Docker build args — the build fails with a clear message if missing).
+4. Render → New → Blueprint (uses `render.yaml`), or configure the existing service to use Docker with `./Dockerfile` at
+   the repository root. Set the runtime env vars from `.env.example`; do not add `LIGHTPANDA_VERSION` or
+   `LIGHTPANDA_SHA256` as service variables because the Dockerfile already pins them.
 5. Add your bot as admin of each target channel.
 6. Check logs for `first run: existing posts marked seen`, then new posts on the next cycle.
 
