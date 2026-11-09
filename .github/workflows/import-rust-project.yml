@@ -1,0 +1,32 @@
+name: Import Rust project archive
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.incoming/part-*.b64'
+permissions:
+  contents: write
+jobs:
+  import-project:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Extract and commit Rust project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .incoming/part-*.b64 | base64 --decode > /tmp/project-outer.gz
+          echo '5388dd4817f2cbf7b4f1bd0d0ccd0c09577c10ba20784bfcd5c1d7bc39e3ec87  /tmp/project-outer.gz' | sha256sum --check -
+          gzip --decompress --stdout /tmp/project-outer.gz > /tmp/project-inner.tar.gz
+          mkdir -p /tmp/project
+          tar -xzf /tmp/project-inner.tar.gz -C /tmp/project
+          test -f /tmp/project/Cargo.toml
+          cp -a /tmp/project/. .
+          rm -f config.py main.py requirements.txt telegram_sender.py
+          git rm -r .incoming .github/workflows/import-rust-project.yml
+          git add -A
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Replace Python bot with Rust implementation"
+          git push origin HEAD:main
