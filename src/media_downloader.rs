@@ -107,10 +107,21 @@ pub async fn fetch_reddit_video(client: &Client, ffmpeg: &str, id: &str, max_tot
     let base = format!("https://v.redd.it/{id}");
     let audio_reserve: u64 = 6 * 1024 * 1024;
     let mut chosen: Option<String> = None;
-    for q in ["DASH_1080", "DASH_720", "DASH_480", "DASH_360", "DASH_240"] {
+    // Reddit's newer transcodes use CMAF_* names; older uploads still use DASH_*.
+    // Probe both families from highest to lowest quality because Reddit does not
+    // guarantee that every resolution exists for every post.
+    for q in [
+        "CMAF_1080", "DASH_1080",
+        "CMAF_720", "DASH_720",
+        "CMAF_480", "DASH_480",
+        "CMAF_360", "DASH_360",
+        "CMAF_270", "DASH_270",
+        "CMAF_240", "DASH_240",
+        "CMAF_220", "DASH_220",
+    ] {
         let u = format!("{base}/{q}.mp4");
         if let Some(len) = probe(client, &u).await {
-            if len.map_or(true, |l| l + audio_reserve <= max_total) {
+            if len.map_or(true, |l| l.saturating_add(audio_reserve) <= max_total) {
                 chosen = Some(u);
                 break;
             }
@@ -119,7 +130,8 @@ pub async fn fetch_reddit_video(client: &Client, ffmpeg: &str, id: &str, max_tot
     let video_url = chosen.ok_or_else(|| anyhow!("no suitable v.redd.it rendition found or all too large"))?;
 
     let mut audio_url = None;
-    for a in ["DASH_AUDIO_128", "DASH_AUDIO_64", "DASH_audio", "audio"] {
+    // CMAF audio names are used by newer Reddit transcodes; retain legacy DASH names.
+    for a in ["CMAF_AUDIO_128", "DASH_AUDIO_128", "CMAF_AUDIO_64", "DASH_AUDIO_64", "DASH_audio", "audio"] {
         let u = format!("{base}/{a}.mp4");
         if probe(client, &u).await.is_some() {
             audio_url = Some(u);
