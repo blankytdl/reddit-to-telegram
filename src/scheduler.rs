@@ -387,6 +387,7 @@ impl Scheduler {
                 break;
             }
             let started = Instant::now();
+            self.health.set_stage("cycle starting", 0);
             // On SIGTERM give the cycle 20 s to wrap up (Render kills after ~30 s), then
             // abandon it so the final state flush still happens.
             let tok = self.token.clone();
@@ -414,7 +415,7 @@ impl Scheduler {
                 self.browser.shutdown().await;
             }
             let wait = self.cfg.interval.saturating_sub(started.elapsed()).max(Duration::from_secs(30)) + self.penalty;
-            self.health.beat(wait.as_secs());
+            self.health.set_stage("idle until next poll", wait.as_secs());
             info!(next_in_secs = wait.as_secs(), "cycle finished");
             tokio::select! {
                 _ = self.token.cancelled() => break,
@@ -449,10 +450,11 @@ impl Scheduler {
                 sleep(cfg.request_gap).await;
             }
             let t0 = Instant::now();
-            self.health.beat(0);
+            self.health.set_stage(&format!("fetching r/{}", g.names.join("+")), 0);
             match self.fetch_group(g).await {
                 Ok(Some(posts)) => {
                     self.process_group(g, posts).await;
+                    self.health.set_stage("checking state sync", 0);
                     self.store.flush_if_due(cfg.flush_min).await;
                     self.next_group = (gi + 1) % n;
                     done += 1;
@@ -470,6 +472,7 @@ impl Scheduler {
             }
             longest = longest.max(t0.elapsed());
         }
+        self.health.set_stage("flushing cycle state", 0);
         self.store.flush().await;
         self.penalty = if limited { next_penalty(self.penalty) } else { Duration::ZERO };
         info!(done, total = n, secs = started.elapsed().as_secs(), "cycle summary");
@@ -507,6 +510,7 @@ impl Scheduler {
         let url = format!("{}/r/{}/{}/?limit={}", self.cfg.reddit_base, names.join("+"), sort.path(), limit);
         let mut delay = Duration::from_secs(30);
         for attempt in 1..=3 {
+            self.health.set_stage(&format!("Reddit fetch r/{} attempt {attempt}", names.join("+")), 0);
             let json = self.browser.fetch(&url).await?;
             match parse_page(&json, limit)? {
                 PageStatus::Ok(p) => return Ok(Some(p)),
@@ -557,6 +561,7 @@ impl Scheduler {
     }
 
     async fn process_group(&mut self, g: &Group, posts: Vec<Post>) {
+        self.health.set_stage(&format!("processing r/{}", g.names.join("+")), 0);
         let chat = g.chat_id.as_str();
         let fetched = posts.len();
         let page_ok = fetched > 0;
@@ -600,6 +605,7 @@ impl Scheduler {
                 return; // subs stay un-marked; nothing is lost, unsent posts are retried next run
             }
             let sub = if p.subreddit.is_empty() { g.names[0].as_str() } else { p.subreddit.as_str() };
+            self.health.set_stage(&format!("post {} from r/{sub}", p.id), 0);
             // First run for this sub+channel: remember what exists, don't flood the channel.
             if !self.cfg.send_backlog && !self.store.sub_known(chat, sub) {
                 self.mark_seen(chat, &p.id);
@@ -628,6 +634,7 @@ impl Scheduler {
                     continue;
                 }
             }
+            info!(sub = %sub, post = %p.id, "delivery started");
             let result = match &p.media {
                 Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id).await,
                 _ => self.deliverer.deliver(chat, &p, g.media_only).await,
