@@ -1,0 +1,32 @@
+name: Keep Render service awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Render health endpoint
+        env:
+          RENDER_HEALTH_URL: https://reddit-to-telegram-vkqa.onrender.com/health
+        run: |
+          echo "Pinging $RENDER_HEALTH_URL"
+          curl --fail --silent --show-error --location \
+            --connect-timeout 15 \
+            --max-time 75 \
+            --retry 2 \
+            --retry-delay 10 \
+            --retry-all-errors \
+            "$RENDER_HEALTH_URL"
+          echo
