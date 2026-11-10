@@ -22,10 +22,11 @@ fn http_client() -> Result<Client> {
         .user_agent(concat!("reddit-telegram-bot/", env!("CARGO_PKG_VERSION")))
         .pool_max_idle_per_host(1)
         .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(120))
         .build()?)
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
