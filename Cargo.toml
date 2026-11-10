@@ -13,7 +13,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros", "time", "fs", "io-util", "process", "signal", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util", "process", "signal", "sync", "net"] }
 tokio-tungstenite = "0.24"
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
