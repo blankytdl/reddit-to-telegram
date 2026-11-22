@@ -473,7 +473,8 @@ impl Scheduler {
             longest = longest.max(t0.elapsed());
         }
         self.health.set_stage("flushing cycle state", 0);
-        self.store.flush().await;
+        // Respect the configured sync interval. A forced flush is still done on shutdown.
+        self.store.flush_if_due(cfg.flush_min).await;
         self.penalty = if limited { next_penalty(self.penalty) } else { Duration::ZERO };
         info!(done, total = n, secs = started.elapsed().as_secs(), "cycle summary");
         Ok(())
