@@ -3,7 +3,7 @@ use crate::{
     health::Health,
     media_downloader as md,
     reddit_browser::Browser,
-    reddit_parser::{parse_gallery, parse_page, GalleryItem, Media, PageStatus, Post},
+    reddit_parser::{parse_gallery, parse_page, GalleryItem, GalleryKind, Media, PageStatus, Post},
     seen_store::SeenStore,
     telegram::{FileKind, Telegram, TgError},
 };
@@ -213,49 +213,102 @@ impl Deliverer {
         }
     }
 
-    /// Sends a whole Reddit gallery as photo albums (10 per album, in gallery order).
-    /// Animated items go afterwards as separate animations (Telegram albums can't hold GIFs).
+    /// Sends every item in a Reddit gallery in its original order:
+    /// photos in albums, GIFs as animations, and Reddit videos as videos.
     pub async fn deliver_gallery(&self, chat: &str, p: &Post, items: &[GalleryItem]) -> Result<()> {
         let spoiler = p.spoiler && self.cfg.spoiler_mode == SpoilerMode::Mark;
         let cap = caption(p, spoiler, self.cfg.caption);
         let c = Ctx { chat, p, cap: cap.clone(), spoiler, media_only: true };
-        let statics: Vec<&GalleryItem> = items.iter().filter(|i| !i.animated).collect();
         let mut sent_any = false;
         let mut cap_used = false;
-        for chunk in statics.chunks(10) {
-            let mut files = Vec::with_capacity(chunk.len());
-            for it in chunk {
-                if let Some(f) = self.fetch_photo(&it.url).await {
-                    files.push(f);
+        let mut index = 0usize;
+
+        while index < items.len() {
+            if items[index].kind == GalleryKind::Photo {
+                // Keep photo albums ordered and capped at Telegram's 10-item album limit.
+                let start = index;
+                while index < items.len()
+                    && index - start < 10
+                    && items[index].kind == GalleryKind::Photo
+                {
+                    index += 1;
                 }
-            }
-            if files.is_empty() {
+
+                let mut files = Vec::with_capacity(index - start);
+                for it in &items[start..index] {
+                    if let Some(file) = self.fetch_photo(&it.url).await {
+                        files.push(file);
+                    }
+                }
+                if files.is_empty() {
+                    continue;
+                }
+                let chunk_cap = if cap_used { "" } else { cap.as_str() };
+                match self.send_album(&c, &files, chunk_cap).await {
+                    Ok(()) => {
+                        sent_any = true;
+                        cap_used = true;
+                    }
+                    Err(e) if sent_any => {
+                        warn!(post = %p.id, "gallery photo album failed after earlier items were sent: {e:#}");
+                    }
+                    Err(e) => return Err(e),
+                }
                 continue;
             }
-            let chunk_cap = if cap_used { "" } else { cap.as_str() };
-            cap_used = true;
-            match self.send_album(&c, &files, chunk_cap).await {
-                Ok(()) => sent_any = true,
+
+            let item = &items[index];
+            index += 1;
+            let item_cap = if cap_used { String::new() } else { cap.clone() };
+            let item_ctx = Ctx {
+                chat,
+                p,
+                cap: item_cap,
+                spoiler,
+                media_only: true,
+            };
+            let result = match item.kind {
+                GalleryKind::Animation => self.media(&item_ctx, &item.url, FileKind::Animation).await,
+                GalleryKind::Video => self.media(&item_ctx, &item.url, FileKind::Video).await,
+                GalleryKind::DashVideo => self.gallery_video_manifest(&item_ctx, &item.url).await,
+                GalleryKind::Photo => unreachable!("photo items are sent in albums"),
+            };
+            match result {
+                Ok(()) => {
+                    sent_any = true;
+                    cap_used = true;
+                }
                 Err(e) if sent_any => {
-                    // Part of the gallery is already out; don't re-send it next cycle.
-                    warn!(post = %p.id, "later album failed after earlier one was sent: {e:#}");
-                    return Ok(());
+                    warn!(post = %p.id, url = %item.url, "gallery media item failed after earlier items were sent: {e:#}");
                 }
                 Err(e) => return Err(e),
             }
         }
-        for it in items.iter().filter(|i| i.animated) {
-            let ac = Ctx { chat, p, cap: if sent_any { String::new() } else { cap.clone() }, spoiler, media_only: true };
-            match self.media(&ac, &it.url, FileKind::Animation).await {
-                Ok(()) => sent_any = true,
-                Err(e) => warn!(post = %p.id, "gallery animation skipped: {e:#}"),
-            }
-        }
+
         if sent_any {
             Ok(())
         } else {
-            bail!("no gallery image could be delivered")
+            bail!("no gallery item could be delivered")
         }
+    }
+
+    async fn gallery_video_manifest(&self, c: &Ctx<'_>, url: &str) -> Result<()> {
+        let file = md::fetch_video_manifest(&self.cfg.ffmpeg_bin, url, self.cfg.max_upload_bytes).await?;
+        let size = file.size().await;
+        self.upload(c, file.path(), size, FileKind::Video).await
+    }
+
+    /// Link fallback is used only when Reddit's gallery metadata itself cannot be read.
+    pub async fn deliver_link(&self, chat: &str, p: &Post, note: &str) -> Result<()> {
+        let spoiler = p.spoiler && self.cfg.spoiler_mode == SpoilerMode::Mark;
+        let c = Ctx {
+            chat,
+            p,
+            cap: caption(p, spoiler, self.cfg.caption),
+            spoiler,
+            media_only: false,
+        };
+        self.link(&c, Some(note)).await
     }
 
     async fn link(&self, c: &Ctx<'_>, note: Option<&str>) -> Result<()> {
@@ -559,8 +612,8 @@ impl Scheduler {
         match items {
             Ok(items) => self.deliverer.deliver_gallery(chat, p, &items).await,
             Err(e) => {
-                warn!(post = %p.id, "gallery could not be resolved; no link fallback: {e:#}");
-                Err(e)
+                warn!(post = %p.id, "gallery metadata could not be resolved; sending original Reddit post link: {e:#}");
+                self.deliverer.deliver_link(chat, p, "Gallery media could not be loaded; open the original post.").await
             }
         }
     }
