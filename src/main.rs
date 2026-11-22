@@ -11,11 +11,105 @@ mod telegram;
 use anyhow::{anyhow, Result};
 use config::{env_get, BrowserSettings, Config, Sort};
 use reqwest::Client;
-use std::{sync::Arc, time::Duration};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::time::{timeout, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt::MakeWriter, prelude::*, EnvFilter};
+
+const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+
+struct RotatingLog {
+    path: PathBuf,
+    file: File,
+    written: u64,
+}
+
+#[derive(Clone)]
+struct LogMakeWriter(Arc<Mutex<RotatingLog>>);
+
+struct LogWriter(Arc<Mutex<RotatingLog>>);
+
+impl<'a> MakeWriter<'a> for LogMakeWriter {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(self.0.clone())
+    }
+}
+
+impl Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut log = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if log.written.saturating_add(buf.len() as u64) > LOG_ROTATE_BYTES {
+            log.file.flush()?;
+            let previous = log.path.with_extension("log.1");
+            match fs::remove_file(&previous) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            fs::rename(&log.path, &previous)?;
+            log.file = OpenOptions::new().create(true).append(true).open(&log.path)?;
+            log.written = 0;
+        }
+        let n = log.file.write(buf)?;
+        log.written = log.written.saturating_add(n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).file.flush()
+    }
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let path = PathBuf::from(
+        std::env::var_os("LOG_PATH").unwrap_or_else(|| "/home/container/logs/bot.log".into()),
+    );
+    let file_writer = (|| -> io::Result<LogMakeWriter> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        if fs::metadata(&path).map(|m| m.len() >= LOG_ROTATE_BYTES).unwrap_or(false) {
+            let previous = path.with_extension("log.1");
+            match fs::remove_file(&previous) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            fs::rename(&path, &previous)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let written = file.metadata()?.len();
+        Ok(LogMakeWriter(Arc::new(Mutex::new(RotatingLog { path: path.clone(), file, written }))))
+    })();
+
+    let console_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    match file_writer {
+        Ok(writer) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(console_layer)
+                .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer))
+                .init();
+            tracing::info!(log_path = %path.display(), "file logging enabled; console logging remains enabled");
+        }
+        Err(e) => {
+            eprintln!("Cannot open log file {}: {e}; continuing with console-only logging", path.display());
+            tracing_subscriber::registry().with(filter).with(console_layer).init();
+        }
+    }
+}
 
 fn http_client() -> Result<Client> {
     Ok(Client::builder()
@@ -28,9 +122,7 @@ fn http_client() -> Result<Client> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
+    init_tracing();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("fetch-test") => fetch_test(&args).await,
@@ -161,6 +253,7 @@ async fn media_test(args: &[String]) -> Result<()> {
         media: reddit_parser::classify_media(url),
         subreddit: "test".into(),
         spoiler: args.get(4).map(|a| a == "spoiler").unwrap_or(false),
+        nsfw: false,
     };
     println!("classified as {:?}", post.media);
     d.deliver(chat, &post, false).await?;
