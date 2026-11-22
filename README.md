@@ -45,7 +45,8 @@ SPOILER_MODE=mark                               # mark | skip | ignore
   (`CYCLE_BUDGET_SECS`, default 80% of the interval): when it runs out it stops and continues round-robin next cycle, and logs a warning
   ("remaining groups run next cycle"). If you see that warning, raise `POLL_INTERVAL_SECS` or trim subs.
 - Telegram sends to one channel are spaced by `SEND_GAP_MS` (3 s) to stay under ~20 messages/minute; a busy 30-sub channel
-  may therefore lag. State is pushed to GitHub at most every `STATE_FLUSH_MIN_SECS` plus at the end of each cycle and on shutdown.
+  may therefore lag. Dirty seen-state data is pushed to GitHub no more often than `STATE_FLUSH_MIN_SECS`; a final flush is attempted on shutdown.
+- **Altare:** Altare sets `ALTARE_GIT_BRANCH` to the branch it deploys on. Keep `GITHUB_STATE_BRANCH` separate from that branch. If they match, the bot automatically switches the state backup to `<deploy-branch>-state` so seen-state commits cannot trigger another deployment.
 
 ## Migrating from the Python bot (reference repo)
 - **Env vars carry over unchanged:** `TELEGRAM_BOT_TOKEN`, `SUBREDDIT_<N>_NAME/_CHAT_ID/_SORT/_LIMIT`, `SUBREDDIT_DEFAULT_SORT/_LIMIT`
