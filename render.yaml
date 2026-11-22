@@ -9,12 +9,6 @@ services:
       # Secrets
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: GITHUB_TOKEN
-        sync: false
-      - key: GITHUB_REPO
-        sync: false
-      - key: GITHUB_STATE_BRANCH
-        value: bot-state
       # Subreddits: comma list, all sent to DEFAULT_CHAT_ID unless written as name=@otherchat
       - key: DEFAULT_CHAT_ID
         sync: false
