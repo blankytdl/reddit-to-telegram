@@ -133,6 +133,7 @@ pub struct Config {
     pub max_upload_bytes: u64,
     pub send_backlog: bool,
     pub spoiler_mode: SpoilerMode,
+    pub include_nsfw: bool,
     pub dedupe_media: bool,
     pub caption: CaptionOpts,
     pub recycle_cycles: u64,
@@ -339,6 +340,7 @@ impl Config {
                 None if flag(get, "BLUR_SPOILERS", true) => SpoilerMode::Mark,
                 None => SpoilerMode::Ignore,
             },
+            include_nsfw: flag(get, "INCLUDE_NSFW", true),
             dedupe_media: flag(get, "DEDUPE_MEDIA", true),
             caption: CaptionOpts {
                 title: flag(get, "INCLUDE_TITLE", true),
@@ -399,6 +401,14 @@ mod tests {
         let c = cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("DEFAULT_CHAT_ID", "@a"), ("SUBREDDITS", "one,two=@b,one")], true).unwrap();
         assert_eq!(c.subs.len(), 2);
         assert_eq!(c.subs[1].chat_id, "@b");
+    }
+
+    #[test]
+    fn nsfw_is_included_by_default_and_can_be_disabled() {
+        let default = cfg(&[("TELEGRAM_BOT_TOKEN", "x")], false).unwrap();
+        assert!(default.include_nsfw);
+        let disabled = cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("INCLUDE_NSFW", "false")], false).unwrap();
+        assert!(!disabled.include_nsfw);
     }
 
     #[test]
