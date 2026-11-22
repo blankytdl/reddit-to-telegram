@@ -54,19 +54,37 @@ impl SeenStore {
     /// A corrupt file is fatal rather than silently resetting deduplication state.
     pub async fn open(path: PathBuf, cap: usize) -> Result<Self> {
         let mut st = Self::new(path, cap);
-        match tokio::fs::read(&st.path).await {
-            Ok(bytes) => {
-                let state: State = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("local seen-state file is corrupt: {}", st.path.display()))?;
-                st.apply(state);
-                info!(ids = st.order.len(), path = %st.path.display(), "seen state restored from host storage");
+        let legacy_path = PathBuf::from("/tmp/rtb-state/seen.json");
+        let bytes = match tokio::fs::read(&st.path).await {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && st.path != legacy_path => {
+                // Migration from the previous build's temporary default, if that file
+                // still exists in this container. No network lookup is performed.
+                match tokio::fs::read(&legacy_path).await {
+                    Ok(bytes) => {
+                        info!(from = %legacy_path.display(), to = %st.path.display(), "migrating previous local seen-state file");
+                        Some(bytes)
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e).with_context(|| format!("cannot read legacy local state {}", legacy_path.display())),
+                }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                info!(path = %st.path.display(), "no local seen-state file yet; a new one will be created");
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("cannot read local seen-state file: {}", st.path.display())),
+        };
+
+        if let Some(bytes) = bytes {
+            let state: State = serde_json::from_slice(&bytes)
+                .with_context(|| format!("local seen-state file is corrupt: {}", st.path.display()))?;
+            st.apply(state);
+            // If loaded from the former /tmp location, immediately persist a copy
+            // in the new host-persistent location.
+            if !tokio::fs::try_exists(&st.path).await.unwrap_or(false) {
+                write_file(&st.path, &bytes).await?;
             }
-            Err(e) => {
-                return Err(e).with_context(|| format!("cannot read local seen-state file: {}", st.path.display()));
-            }
+            info!(ids = st.order.len(), path = %st.path.display(), "seen state restored from host storage");
+        } else {
+            info!(path = %st.path.display(), "no local seen-state file yet; a new one will be created");
         }
         Ok(st)
     }
