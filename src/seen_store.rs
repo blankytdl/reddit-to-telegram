@@ -10,7 +10,6 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::time::sleep;
 use tracing::{info, warn};
 
 #[derive(Serialize)]
