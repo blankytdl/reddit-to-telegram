@@ -23,6 +23,8 @@ struct RawPost {
     subreddit: String,
     #[serde(default)]
     spoiler: bool,
+    #[serde(default)]
+    nsfw: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +61,7 @@ pub struct Post {
     pub media: Media,
     pub subreddit: String,
     pub spoiler: bool,
+    pub nsfw: bool,
 }
 
 impl Media {
@@ -234,6 +237,7 @@ pub fn parse_page(json: &str, limit: usize) -> Result<PageStatus> {
                 media: classify_media(&p.url),
                 source_url: if external { p.url.clone() } else { String::new() },
                 spoiler: p.spoiler || title_has_spoiler_tag(&p.title),
+                nsfw: p.nsfw,
                 subreddit: p.subreddit,
                 // Same id format as the Python bot (bare lowercase base-36), so old state matches.
                 id: p.fullname.trim_start_matches("t3_").to_ascii_lowercase(),
@@ -286,9 +290,10 @@ mod tests {
         let j = r#"{"title":"x","text":"","posts":[
           {"fullname":"t3_a","author":"b","permalink":"/r/x/comments/a/","url":"https://i.redd.it/a.png","title":"Ep 5 [Spoiler] twist","subreddit":"anime"},
           {"fullname":"t3_b","author":"b","permalink":"/r/x/comments/b/","url":"https://i.redd.it/b.png","title":"plain","spoiler":true,"subreddit":"manga"},
-          {"fullname":"t3_c","author":"b","permalink":"/r/x/comments/c/","url":"https://i.redd.it/c.png","title":"clean"}]}"#;
+          {"fullname":"t3_c","author":"b","permalink":"/r/x/comments/c/","url":"https://i.redd.it/c.png","title":"clean","nsfw":true}]}"#;
         let PageStatus::Ok(p) = parse_page(j, 10).unwrap() else { panic!() };
         assert!(p[0].spoiler && p[1].spoiler && !p[2].spoiler);
+        assert!(!p[0].nsfw && !p[1].nsfw && p[2].nsfw);
         assert_eq!(p[0].subreddit, "anime");
         assert!(title_has_spoiler_tag("x [ SPOILER ]") && title_has_spoiler_tag("y (spoiler)"));
         assert!(!title_has_spoiler_tag("no spoilers here"));
