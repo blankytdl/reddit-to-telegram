@@ -417,9 +417,23 @@ impl Scheduler {
             let wait = self.cfg.interval.saturating_sub(started.elapsed()).max(Duration::from_secs(30)) + self.penalty;
             self.health.set_stage("idle until next poll", wait.as_secs());
             info!(next_in_secs = wait.as_secs(), "cycle finished");
-            tokio::select! {
-                _ = self.token.cancelled() => break,
-                _ = sleep(wait) => {}
+            // Keep the host console visibly alive during the poll interval.
+            // This is only a log heartbeat; it does not trigger Reddit requests or state writes.
+            let mut remaining = wait;
+            while !remaining.is_zero() {
+                let tick = remaining.min(Duration::from_secs(60));
+                tokio::select! {
+                    _ = self.token.cancelled() => break,
+                    _ = sleep(tick) => {
+                        remaining = remaining.saturating_sub(tick);
+                        if !remaining.is_zero() {
+                            info!(next_in_secs = remaining.as_secs(), "waiting for next poll");
+                        }
+                    }
+                }
+            }
+            if self.token.is_cancelled() {
+                break;
             }
         }
         info!("shutting down: flushing state");
