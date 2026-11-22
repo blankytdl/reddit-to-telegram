@@ -358,11 +358,12 @@ mod tests {
             "vid2":{"status":"valid","e":"RedditVideo","m":"video/mp4","dashUrl":"https://v.redd.it/link/post/asset/vid2/DASHPlaylist.mpd"}
           }}}]}}]"#;
         let g = parse_gallery(j).unwrap();
-        assert_eq!(g.len(), 4);
+        assert_eq!(g.len(), 5);
         assert_eq!(g[0], GalleryItem { url: "https://i.redd.it/aaa.jpg".into(), kind: GalleryKind::Photo });
         assert_eq!(g[1], GalleryItem { url: "https://i.redd.it/bbb.gif".into(), kind: GalleryKind::Animation });
         assert_eq!(g[2], GalleryItem { url: "https://i.redd.it/ddd.png".into(), kind: GalleryKind::Photo });
         assert_eq!(g[3], GalleryItem { url: "https://v.redd.it/vid1/DASH_720.mp4".into(), kind: GalleryKind::Video });
+        assert_eq!(g[4], GalleryItem { url: "https://v.redd.it/link/post/asset/vid2/DASHPlaylist.mpd".into(), kind: GalleryKind::DashVideo });
 
         let with_source = r#" [{"data":{"children":[{"data":{"gallery_data":{"items":[{"media_id":"source1"}]},
           "media_metadata":{"source1":{"status":"valid","e":"Image","m":"image/jpeg",
