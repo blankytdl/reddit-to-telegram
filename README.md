@@ -1,13 +1,10 @@
-# Reddit → Telegram bot (Rust, Lightpanda, Render Free)
+# Reddit → Telegram bot (Rust, Lightpanda)
 
 Replacement for the RSS-based bot. It drives a real headless browser (Lightpanda, one persistent
 process, one page at a time) to read `old.reddit.com` listings, then forwards posts and media to
 Telegram via the Bot API.
 
-> **STATUS: written but NOT compiled or tested.** It was authored in a sandbox with no Rust toolchain
-> and no network access. Nothing below has been run against Reddit, Telegram, GitHub or Render. Run
-> `scripts/verify.sh` and fill in `docs/COMPATIBILITY_AND_RESOURCES.md` before trusting it.
-> Expect to fix a few compile errors on first `cargo build`.
+> Build and test the Rust application with `cargo test` and `cargo build --release` before deployment.
 
 Your existing Python implementation is untouched: this lives in its own directory.
 
@@ -19,11 +16,11 @@ Your existing Python implementation is untouched: this lives in its own director
 - `media_downloader.rs` – streaming, size-capped downloads to temp files (deleted on drop); Reddit DASH
   video+audio are remuxed with `ffmpeg -c copy` (no re-encode).
 - `telegram.rs` – direct Bot API, streamed multipart uploads, retry on 429 (`retry_after`) / 5xx.
-- `seen_store.rs` – seen IDs in memory, local JSON file, GitHub Contents API backup on branch `bot-state`.
+- `seen_store.rs` – bounded seen IDs and initialized-subreddit markers saved to one local JSON file on the host.
 - `scheduler.rs` – sequential cycle every 15 min, exponential backoff on rate limit, per-post failure cap.
 - `health.rs`, `self_ping.rs` – `/health` (200/503) and optional best-effort self-ping.
 
-SQLite was deliberately not used: a small JSON file plus the GitHub copy is simpler and avoids a C build dependency.
+SQLite and remote state services are deliberately not used. The bot stores its bounded state in a local JSON file; it needs no GitHub token, database, or external state service.
 
 ## New options (anime-channel setup)
 ```
@@ -45,16 +42,14 @@ SPOILER_MODE=mark                               # mark | skip | ignore
   (`CYCLE_BUDGET_SECS`, default 80% of the interval): when it runs out it stops and continues round-robin next cycle, and logs a warning
   ("remaining groups run next cycle"). If you see that warning, raise `POLL_INTERVAL_SECS` or trim subs.
 - Telegram sends to one channel are spaced by `SEND_GAP_MS` (3 s) to stay under ~20 messages/minute; a busy 30-sub channel
-  may therefore lag. Dirty seen-state data is pushed to GitHub no more often than `STATE_FLUSH_MIN_SECS`; a final flush is attempted on shutdown.
-- **Altare:** Altare sets `ALTARE_GIT_BRANCH` to the branch it deploys on. Keep `GITHUB_STATE_BRANCH` separate from that branch. If they match, the bot automatically switches the state backup to `<deploy-branch>-state` so seen-state commits cannot trigger another deployment.
+  may therefore lag. Dirty seen-state data is written locally no more often than `STATE_FLUSH_MIN_SECS`; it is also saved on shutdown.
+- **Host-local persistence:** the default Altare path is `/home/container/data/seen_posts.json`. The directory is created automatically. Keep this path on the server's persistent filesystem; do not put it under a temporary/cache directory. On a host that replaces its entire filesystem on redeploy, mount or select a persistent data directory and set `STATE_PATH` to that location.
 
 ## Migrating from the Python bot (reference repo)
 - **Env vars carry over unchanged:** `TELEGRAM_BOT_TOKEN`, `SUBREDDIT_<N>_NAME/_CHAT_ID/_SORT/_LIMIT`, `SUBREDDIT_DEFAULT_SORT/_LIMIT`
-  (default limit 12), `SKIP_TEXT_ONLY_POSTS` (default `true`, = `MEDIA_ONLY`), `BLUR_SPOILERS`, `GITHUB_TOKEN/_REPO/_STATE_BRANCH`,
-  `GITHUB_SEEN_PATH`, `GITHUB_SYNC_INTERVAL_SECONDS` (default 60), `MAX_MEDIA_DOWNLOAD_BYTES`, plus `INCLUDE_TITLE/_FOOTER/_REDDIT_LINK`
+  (default limit 12), `SKIP_TEXT_ONLY_POSTS` (default `true`, = `MEDIA_ONLY`), `BLUR_SPOILERS`, `MAX_MEDIA_DOWNLOAD_BYTES`, plus `INCLUDE_TITLE/_FOOTER/_REDDIT_LINK`
   (these three were hardcoded in `config.py`; now env vars). Per-sub `_LIMIT` is honoured; grouped subs load `sum(limits)` posts (max 100).
-- **Old state is imported.** On the first start with no `seen_posts.json` on the state branch, the bot reads the old
-  `seen/<sub>.json` files (`GITHUB_SEEN_PATH`) from the same branch, so nothing already posted is sent again; those subs also skip first-run seeding.
+- **Local state only:** existing host state is loaded from `STATE_PATH`. There is no GitHub API integration or remote backup. Back up the JSON file yourself before deleting or recreating the server. If the state file is missing, the first run seeds existing Reddit posts instead of sending the whole backlog (`SEND_BACKLOG_ON_FIRST_RUN=true` changes this).
 - **Same caption layout:** title / `r/sub • u/author` / "Open on Reddit" link. Spoiler detection keeps the Python heuristics
   (title `[spoiler`/`(spoiler)`, flair) plus old.reddit's spoiler stamp. Seen-tracking is per destination channel, like `channel_seen`.
 - **Tall/wide images** are padded with white to stay under Telegram's 20:1 limit (as the Pillow code did), via `ffmpeg`.
@@ -96,18 +91,15 @@ readable text, and whether Reddit rate-limits these extra loads.
   or a chat message. The cookie is a login credential and may expire; replace it in the host settings if access stops.
   The bot does not bypass CAPTCHA or other access controls. Lightpanda sends its own User-Agent; it is not spoofed.
 
-## Deploy on Render
-1. Lightpanda is pinned in `Dockerfile` to the official `1.0.3` Linux x86_64 release, with its published SHA-256. No
-   Lightpanda build variables need to be entered in Render. To upgrade it, verify the Linux x86_64 asset and digest at
-   https://github.com/lightpanda-io/browser/releases, then update the two `ARG` defaults in `Dockerfile`.
-2. In the repo: `cargo generate-lockfile` and commit `Cargo.lock` (pins dependencies). Then remove nothing else; `Cargo.toml` uses semver ranges.
-3. Create a GitHub fine-grained token with **Contents: read/write** on one repo (can be private). No need to create the branch; the bot does.
-4. Render → New → Blueprint (uses `render.yaml`), or configure the existing service to use Docker with `./Dockerfile` at
-   the repository root. Set the runtime env vars from `.env.example`. For Old Reddit, also add `REDDIT_SESSION_COOKIE`
-   as a secret environment variable (the `reddit_session` cookie value from your own logged-in account). Do not add
-   `LIGHTPANDA_VERSION` or `LIGHTPANDA_SHA256`; the Dockerfile already pins them.
-5. Add your bot as admin of each target channel.
-6. Check logs for `first run: existing posts marked seen`, then new posts on the next cycle.
+## Deploy on Altare
+1. Build with `cargo build --release` and start `./target/release/reddit-telegram-bot`.
+2. Set the required Telegram and subreddit environment variables from `.env.example`.
+3. Set `STATE_PATH=/home/container/data/seen_posts.json` (or another directory that survives server restarts and rebuilds). The bot creates the parent directory and file automatically.
+4. Install Lightpanda at the configured `LIGHTPANDA_BIN` path and make it executable.
+5. Add your bot as an administrator of each target Telegram channel.
+6. Check startup logs for `seen state restored from host storage` or `no local seen-state file yet`.
+
+There is no GitHub token, GitHub state branch, or GitHub API dependency. The local JSON file is the only seen-state store. A host-side backup/export is recommended before server reinstall or deletion.
 
 Never commit `.env`. Tokens are never logged (Telegram URLs are stripped from errors).
 
