@@ -158,6 +158,38 @@ pub async fn fetch_reddit_video(client: &Client, ffmpeg: &str, id: &str, max_tot
     }
 }
 
+/// Downloads/remuxes a Reddit gallery DASH or HLS manifest into one MP4 file.
+/// The output is size-capped and retains both video and audio streams when present.
+pub async fn fetch_video_manifest(ffmpeg: &str, url: &str, max_total: u64) -> Result<TempFile> {
+    let out = TempFile::new("mp4");
+    let size_cap = max_total.saturating_add(1);
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args([
+        "-nostdin", "-loglevel", "error", "-y", "-threads", "1",
+        "-rw_timeout", "30000000", "-i", url,
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c", "copy", "-t", "240", "-fs", &size_cap.to_string(),
+        "-movflags", "+faststart",
+    ])
+    .arg(out.path())
+    .stdin(Stdio::null())
+    .kill_on_drop(true);
+    let status = timeout(Duration::from_secs(300), cmd.status())
+        .await
+        .map_err(|_| anyhow!("gallery video remux timed out"))??;
+    if !status.success() {
+        bail!("gallery video remux exited with {status}");
+    }
+    let size = out.size().await;
+    if size == 0 {
+        bail!("gallery video remux produced an empty file");
+    }
+    if size > max_total {
+        return Err(TooLarge(size).into());
+    }
+    Ok(out)
+}
+
 async fn mux(ffmpeg: &str, video: &Path, audio: &Path, out: &Path) -> Result<()> {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-nostdin", "-loglevel", "error", "-y", "-threads", "1", "-i"])
