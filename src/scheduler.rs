@@ -612,8 +612,8 @@ impl Scheduler {
             info!(subs = %g.names.join("+"), new = fresh_count, "processing");
         }
         let (mut sent, mut seeded, mut skipped) = (0u32, 0u32, 0u32);
-        let (mut filtered_media_only, mut filtered_spoiler, mut duplicate_media, mut failed) =
-            (0u32, 0u32, 0u32, 0u32);
+        let (mut filtered_nsfw, mut filtered_media_only, mut filtered_spoiler, mut duplicate_media, mut failed) =
+            (0u32, 0u32, 0u32, 0u32, 0u32);
 
         for p in fresh {
             if self.token.is_cancelled() {
@@ -627,7 +627,15 @@ impl Scheduler {
                 seeded += 1;
                 continue;
             }
-            if g.media_only && p.media == Media::None {
+            if p.nsfw && !self.cfg.include_nsfw {
+                self.mark_seen(chat, &p.id);
+                filtered_nsfw += 1;
+                skipped += 1;
+                continue;
+            }
+            // When NSFW is enabled, keep flagged posts even if MEDIA_ONLY is on.
+            // Unsupported external media is still sent as its Reddit post link.
+            if g.media_only && p.media == Media::None && !(p.nsfw && self.cfg.include_nsfw) {
                 self.mark_seen(chat, &p.id);
                 filtered_media_only += 1;
                 skipped += 1;
@@ -692,6 +700,7 @@ impl Scheduler {
             already_seen,
             duplicate_in_batch,
             seeded,
+            filtered_nsfw,
             filtered_media_only,
             filtered_spoiler,
             duplicate_media,
@@ -717,6 +726,7 @@ mod tests {
             media: Media::None,
             subreddit: "anime".into(),
             spoiler,
+            nsfw: false,
         }
     }
 
