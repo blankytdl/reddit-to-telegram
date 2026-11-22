@@ -56,9 +56,6 @@ async fn wait_signal() {
 
 async fn run() -> Result<()> {
     let cfg = Arc::new(Config::from_env(true)?);
-    if let Some(gh) = cfg.github.as_ref() {
-        info!(state_branch = %gh.branch, "GitHub seen-state backup enabled");
-    }
     let configured_subreddits = cfg.subs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(",");
     let configured_groups = cfg.groups.iter().map(|g| g.names.join("+")).collect::<Vec<_>>().join(" | ");
     info!(
@@ -87,12 +84,8 @@ async fn run() -> Result<()> {
     // Bind the port first so Render's port scan succeeds while state is restored.
     let hs = tokio::spawn(health::serve(cfg.port, health.clone(), token.clone()));
 
-    let store = seen_store::SeenStore::open(
-        cfg.state_path.clone(),
-        cfg.seen_cap,
-        cfg.github.clone().map(|g| (http.clone(), g)),
-    )
-    .await?;
+    info!(state_path = %cfg.state_path.display(), "using host-local seen-state storage");
+    let store = seen_store::SeenStore::open(cfg.state_path.clone(), cfg.seen_cap).await?;
 
     if let Some((url, every)) = cfg.self_ping.clone() {
         tokio::spawn(self_ping::run(http.clone(), url, every, token.clone()));
