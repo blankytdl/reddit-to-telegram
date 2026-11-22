@@ -56,6 +56,9 @@ async fn wait_signal() {
 
 async fn run() -> Result<()> {
     let cfg = Arc::new(Config::from_env(true)?);
+    if let Some(gh) = cfg.github.as_ref() {
+        info!(state_branch = %gh.branch, "GitHub seen-state backup enabled");
+    }
     let configured_subreddits = cfg.subs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(",");
     let configured_groups = cfg.groups.iter().map(|g| g.names.join("+")).collect::<Vec<_>>().join(" | ");
     info!(
