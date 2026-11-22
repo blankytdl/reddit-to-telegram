@@ -17,6 +17,7 @@ Your existing Python implementation is untouched: this lives in its own director
   video+audio are remuxed with `ffmpeg -c copy` (no re-encode).
 - `telegram.rs` – direct Bot API, streamed multipart uploads, retry on 429 (`retry_after`) / 5xx.
 - `seen_store.rs` – bounded seen IDs and initialized-subreddit markers saved to one local JSON file on the host.
+- `main.rs` – logs to both the Altare console and a separate rotating log file; log files never share the seen-state directory.
 - `scheduler.rs` – sequential cycle every 15 min, exponential backoff on rate limit, per-post failure cap.
 - `health.rs`, `self_ping.rs` – `/health` (200/503) and optional best-effort self-ping.
 
@@ -26,14 +27,17 @@ SQLite and remote state services are deliberately not used. The bot stores its b
 ```
 DEFAULT_CHAT_ID=@animechannel
 SUBREDDITS=anime,manga,animememes,AnimeART     # many subs -> one channel
-MEDIA_ONLY=true                                 # only images / GIFs / videos
+MEDIA_ONLY=true                                 # only images / GIFs / videos, except flagged NSFW posts when INCLUDE_NSFW=true
+INCLUDE_NSFW=true                               # send Reddit-marked 18+ posts
 SPOILER_MODE=mark                               # mark | skip | ignore
 ```
 - **Many subs, one channel:** `SUBREDDITS` (comma list; `name=@chat` overrides the channel) and/or numbered
   `SUBREDDIT_n_*` vars. Subs with the same channel/sort/media-only settings are fetched in **one page load** via
   `r/a+b+c` (`GROUP_MAX_SUBS`, default 8), so 30 subs ≈ 4 page loads instead of 30. If a combined page comes back empty
   the bot retries each sub separately. The same image/video posted in several subs is sent to a channel once (`DEDUPE_MEDIA`).
-- **Media only:** `MEDIA_ONLY=true` (global) or `SUBREDDIT_n_MEDIA_ONLY` (per sub) drops text/link/gallery posts.
+- **Media only:** `MEDIA_ONLY=true` (global) or `SUBREDDIT_n_MEDIA_ONLY` (per sub) drops ordinary text/link posts. Reddit-marked NSFW posts are still forwarded when `INCLUDE_NSFW=true`; unsupported external media is sent as the Reddit post link.
+- **NSFW:** `INCLUDE_NSFW=true` (default) keeps posts Reddit marks with its `over18`/NSFW listing marker. The browser still needs a valid `REDDIT_SESSION_COOKIE` from an account authorized to view mature content; enable the mature-content preference on Reddit and Old Reddit before copying the session cookie. This does not bypass Reddit age checks or restrictions.
+- **Separate files:** seen IDs are stored at `/home/container/data/seen_posts.json`; console logs are also written to `/home/container/logs/bot.log` (with one `.log.1` backup at 5 MiB). Set `STATE_PATH` and `LOG_PATH` independently to change these locations.
 - **Spoilers:** posts flagged as spoilers are sent with Telegram's spoiler overlay (`has_spoiler`) and the title in a
   spoiler tag; `skip` drops them, `ignore` treats them normally. Detection = old.reddit's spoiler stamp/flair or a
   `[spoiler]` tag in the title — selectors are **unverified** against live Reddit. Documents (oversized images) cannot be overlaid.
@@ -94,10 +98,11 @@ readable text, and whether Reddit rate-limits these extra loads.
 ## Deploy on Altare
 1. Build with `cargo build --release` and start `./target/release/reddit-telegram-bot`.
 2. Set the required Telegram and subreddit environment variables from `.env.example`.
-3. Set `STATE_PATH=/home/container/data/seen_posts.json` (or another directory that survives server restarts and rebuilds). The bot creates the parent directory and file automatically.
-4. Install Lightpanda at the configured `LIGHTPANDA_BIN` path and make it executable.
-5. Add your bot as an administrator of each target Telegram channel.
-6. Check startup logs for `seen state restored from host storage` or `no local seen-state file yet`.
+3. Set `STATE_PATH=/home/container/data/seen_posts.json` and `LOG_PATH=/home/container/logs/bot.log`; these directories are created automatically and are separate.
+4. Set `INCLUDE_NSFW=true` (default). On the Reddit account used for `REDDIT_SESSION_COOKIE`, enable mature content in Reddit settings and in [Old Reddit preferences](https://old.reddit.com/prefs/).
+5. Install Lightpanda at the configured `LIGHTPANDA_BIN` path and make it executable.
+6. Add your bot as an administrator of each target Telegram channel.
+7. Check startup logs for `file logging enabled`, `seen state restored from host storage`, or `no local seen-state file yet`.
 
 There is no GitHub token, GitHub state branch, or GitHub API dependency. The local JSON file is the only seen-state store. A host-side backup/export is recommended before server reinstall or deletion.
 
