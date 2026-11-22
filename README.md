@@ -78,8 +78,8 @@ readable text, and whether Reddit rate-limits these extra loads.
 ## Behaviour you should know
 - **First run seeds, doesn't flood.** For each subreddit+channel with no history, existing posts are recorded as seen and
   *not* sent (`SEND_BACKLOG_ON_FIRST_RUN=true` to change).
-- If GitHub is configured and the restore fails after 5 tries, the bot **exits** instead of starting with empty
-  history (prevents duplicate floods). Render will restart it.
+- If the local state file is corrupt or cannot be read, the bot **exits** rather than silently resetting deduplication history.
+  If the state file is missing, the first run seeds existing Reddit posts instead of sending the whole backlog.
 - Posts are marked seen only after successful delivery; a post failing 3 cycles in a row is skipped.
 - Media: photo → `sendPhoto` (oversized/rejected → resized, still a photo; document only as last resort); GIF → `sendAnimation`;
   MP4 / v.redd.it → `sendVideo`. Over 50 MB or undownloadable → a link message. Galleries, text posts and
@@ -115,8 +115,8 @@ Subcommands: `reddit-telegram-bot fetch-test <sub> [new|hot]` (browser + parser 
 - Render Free spins down after ~15 min without inbound traffic. Self-pinging the public URL only helps while the instance is
   running; it cannot wake a stopped one. If it spins down, polling stops until something external hits the URL
   (e.g. an uptime monitor) — and 750 free hours/month is ~31 days × 24 h = 744 h for ONE always-on service.
-- Render deploys can briefly run two instances; with a shared GitHub state file that can cause duplicates or a last-write-wins overwrite.
-- Filesystem is ephemeral; only the GitHub branch survives restarts. Crash between sending and flushing can re-send ≤1 subreddit's posts.
+- Local state is only as durable as the host's data directory. Keep `STATE_PATH` on persistent server storage and export the JSON file before reinstalling or deleting the server. A crash between sending and flushing can re-send some recent posts.
+- On platforms with ephemeral container filesystems, including an unmounted Render container, state is lost when the instance is replaced. Use a persistent disk or a host with persistent storage.
 - Reddit may block Render's datacenter IPs or Lightpanda's client. The compatibility of Lightpanda with `old.reddit.com` is unknown until you run `fetch-test`.
 - `old.reddit.com` markup selectors (`#siteTable > div.thing`, `data-*`) are assumed from memory of the site.
 - Lightpanda is AGPL-3.0; running it as an unmodified separate process for a private bot is generally fine, but check against your own use.
