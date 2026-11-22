@@ -108,16 +108,6 @@ pub struct BrowserSettings {
     pub reddit_session_cookie: Option<String>,
 }
 
-#[derive(Clone)]
-pub struct GithubSettings {
-    pub token: String,
-    pub repo: String,
-    pub branch: String,
-    pub api_base: String,
-    /// Folder of the old Python bot's per-subreddit files (GITHUB_SEEN_PATH), imported once.
-    pub seen_dir: String,
-}
-
 /// Deliberately no `Debug` derive: holds secrets.
 #[derive(Clone)]
 pub struct Config {
@@ -132,7 +122,6 @@ pub struct Config {
     pub reddit_base: String,
     pub telegram_token: String,
     pub telegram_base: String,
-    pub github: Option<GithubSettings>,
     pub state_path: PathBuf,
     pub port: u16,
     pub self_ping: Option<(String, Duration)>,
@@ -296,35 +285,6 @@ impl Config {
 
         let telegram_token = get("TELEGRAM_BOT_TOKEN").ok_or_else(|| anyhow!("TELEGRAM_BOT_TOKEN is required"))?;
 
-        let github = match (get("GITHUB_TOKEN"), get("GITHUB_REPO")) {
-            (Some(token), Some(repo)) => {
-                let requested_branch = s(get, "GITHUB_STATE_BRANCH", "bot-state");
-                // Altare deploys on every push to ALTARE_GIT_BRANCH. Never write seen-state
-                // commits to that branch, or every state flush can redeploy this same app.
-                let state_branch = match get("ALTARE_GIT_BRANCH") {
-                    Some(deploy_branch) if deploy_branch == requested_branch => {
-                        let safe_branch = format!("{requested_branch}-state");
-                        tracing::warn!(
-                            deploy_branch = %deploy_branch,
-                            state_branch = %safe_branch,
-                            "GITHUB_STATE_BRANCH matches Altare's deploy branch; using a separate state branch"
-                        );
-                        safe_branch
-                    }
-                    _ => requested_branch,
-                };
-                Some(GithubSettings {
-                    token,
-                    repo,
-                    branch: state_branch,
-                    api_base: s(get, "GITHUB_API_BASE", "https://api.github.com"),
-                    seen_dir: s(get, "GITHUB_SEEN_PATH", "seen").trim_matches('/').to_string(),
-                })
-            }
-            (None, None) => None,
-            _ => bail!("GITHUB_TOKEN and GITHUB_REPO must be set together"),
-        };
-
         let interval_secs = num(get, "POLL_INTERVAL_SECS", 900u64)?.max(60);
         let post_limit = default_limit;
 
@@ -352,15 +312,14 @@ impl Config {
             post_limit,
             request_gap: Duration::from_secs(num(get, "REQUEST_GAP_SECS", 5u64)?),
             send_gap: Duration::from_millis(num(get, "SEND_GAP_MS", 3000u64)?),
-            flush_min: Duration::from_secs(match first(get, &["STATE_FLUSH_MIN_SECS", "GITHUB_SYNC_INTERVAL_SECONDS"]) {
+            flush_min: Duration::from_secs(match get("STATE_FLUSH_MIN_SECS") {
                 Some(v) => v.trim().parse::<u64>().map_err(|e| anyhow!("STATE_FLUSH_MIN_SECS: {e}"))?,
                 None => 60,
             }),
             reddit_base: s(get, "REDDIT_BASE_URL", "https://old.reddit.com").trim_end_matches('/').to_string(),
             telegram_token,
             telegram_base: s(get, "TELEGRAM_API_BASE", "https://api.telegram.org").trim_end_matches('/').to_string(),
-            github,
-            state_path: PathBuf::from(s(get, "STATE_PATH", "/tmp/rtb-state/seen.json")),
+            state_path: PathBuf::from(s(get, "STATE_PATH", "/home/container/data/seen_posts.json")),
             port: num(get, "PORT", 10000u16)?,
             self_ping,
             browser: BrowserSettings::from_lookup(get)?,
@@ -459,7 +418,7 @@ mod tests {
         let c = cfg(
             &[("TELEGRAM_BOT_TOKEN", "x"), ("SUBREDDIT_1_NAME", "aww"), ("SUBREDDIT_1_CHAT_ID", "@a"), ("SUBREDDIT_1_LIMIT", "20"),
               ("SUBREDDIT_2_NAME", "pics"), ("SUBREDDIT_2_CHAT_ID", "@a"), ("SUBREDDIT_DEFAULT_SORT", "hot"),
-              ("SUBREDDIT_DEFAULT_LIMIT", "7"), ("SKIP_TEXT_ONLY_POSTS", "false"), ("GITHUB_SYNC_INTERVAL_SECONDS", "300"), ("BLUR_SPOILERS", "false")],
+              ("SUBREDDIT_DEFAULT_LIMIT", "7"), ("SKIP_TEXT_ONLY_POSTS", "false"), ("STATE_FLUSH_MIN_SECS", "300"), ("BLUR_SPOILERS", "false")],
             true,
         )
         .unwrap();
@@ -488,28 +447,9 @@ mod tests {
         assert!(cfg(&[("SUBREDDIT_1_NAME", "a"), ("SUBREDDIT_1_CHAT_ID", "@a")], true).is_err()); // no token
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x")], true).is_err());
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x")], false).is_ok());
-        assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("GITHUB_TOKEN", "t")], false).is_err());
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("DEFAULT_CHAT_ID", "@a"), ("SUBREDDITS", "bad/name")], true).is_err());
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("DEFAULT_CHAT_ID", "@a"), ("SUBREDDITS", "a,b,c"), ("MAX_SUBREDDITS", "2")], true).is_err());
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("SPOILER_MODE", "nope")], false).is_err());
-    }
-
-    #[test]
-    fn altare_seen_state_branch_never_matches_deploy_branch() {
-        let c = cfg(
-            &[
-                ("TELEGRAM_BOT_TOKEN", "x"),
-                ("GITHUB_TOKEN", "token"),
-                ("GITHUB_REPO", "owner/repo"),
-                ("GITHUB_STATE_BRANCH", "main"),
-                ("ALTARE_GIT_BRANCH", "main"),
-                ("SUBREDDIT_1_NAME", "anime"),
-                ("SUBREDDIT_1_CHAT_ID", "@anime"),
-            ],
-            true,
-        )
-        .unwrap();
-        assert_eq!(c.github.unwrap().branch, "main-state");
     }
 
     #[test]
