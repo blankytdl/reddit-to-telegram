@@ -25,10 +25,13 @@ RUN curl -fsSL -o /usr/local/bin/lightpanda \
  && chmod +x /usr/local/bin/lightpanda
 
 COPY --from=build /src/target/release/reddit-telegram-bot /usr/local/bin/reddit-telegram-bot
-RUN useradd -r -m bot
+RUN useradd -r -m bot \
+ && mkdir -p /app/data \
+ && chown -R bot:bot /app
+WORKDIR /app
 USER bot
 ENV LIGHTPANDA_BIN=/usr/local/bin/lightpanda \
     LIGHTPANDA_DISABLE_TELEMETRY=true \
-    STATE_PATH=/tmp/rtb-state/seen.json \
+    STATE_PATH=/app/data/seen_posts.json \
     RUST_LOG=info
 CMD ["reddit-telegram-bot"]
