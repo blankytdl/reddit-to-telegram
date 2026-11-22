@@ -24,9 +24,13 @@ pub const EXTRACT_JS: &str = r#"(() => {
     const spoiler = el.getAttribute('data-spoiler') === 'true'
       || !!el.querySelector('.entry .spoiler-stamp')
       || (!!flair && /spoiler/i.test(flair.textContent || ''));
+    const nsfw = el.classList.contains('over18')
+      || el.classList.contains('nsfw')
+      || el.getAttribute('data-nsfw') === 'true';
     posts.push({
       subreddit: el.getAttribute('data-subreddit') || '',
       spoiler: spoiler,
+      nsfw: nsfw,
       fullname: el.getAttribute('data-fullname') || '',
       author: el.getAttribute('data-author') || '',
       permalink: el.getAttribute('data-permalink') || '',
