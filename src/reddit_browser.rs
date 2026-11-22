@@ -45,7 +45,7 @@ pub const EXTRACT_JS: &str = r#"(() => {
 })()"#;
 
 /// Returns the raw page text (used to read a post's JSON document in the browser).
-pub const TEXT_JS: &str = "((document.body && document.body.textContent) || '')";
+pub const TEXT_JS: &str = "fetch(location.href, { credentials: 'include', headers: { Accept: 'application/json' } }).then(r => r.text())";
 
 struct Cdp {
     ws: Ws,
@@ -245,7 +245,7 @@ async fn navigate_and_extract(cdp: &mut Cdp, target: &str, url: &str, step: Dura
         warn!("no load event seen; extracting anyway");
     }
     let r = cdp
-        .call("Runtime.evaluate", json!({ "expression": script, "returnByValue": true }), s, step)
+        .call("Runtime.evaluate", json!({ "expression": script, "returnByValue": true, "awaitPromise": true }), s, step)
         .await?;
     if let Some(ex) = r.get("exceptionDetails") {
         bail!("extraction script threw: {ex}");
