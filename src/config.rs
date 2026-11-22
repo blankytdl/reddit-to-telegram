@@ -297,13 +297,30 @@ impl Config {
         let telegram_token = get("TELEGRAM_BOT_TOKEN").ok_or_else(|| anyhow!("TELEGRAM_BOT_TOKEN is required"))?;
 
         let github = match (get("GITHUB_TOKEN"), get("GITHUB_REPO")) {
-            (Some(token), Some(repo)) => Some(GithubSettings {
-                token,
-                repo,
-                branch: s(get, "GITHUB_STATE_BRANCH", "bot-state"),
-                api_base: s(get, "GITHUB_API_BASE", "https://api.github.com"),
-                seen_dir: s(get, "GITHUB_SEEN_PATH", "seen").trim_matches('/').to_string(),
-            }),
+            (Some(token), Some(repo)) => {
+                let requested_branch = s(get, "GITHUB_STATE_BRANCH", "bot-state");
+                // Altare deploys on every push to ALTARE_GIT_BRANCH. Never write seen-state
+                // commits to that branch, or every state flush can redeploy this same app.
+                let state_branch = match get("ALTARE_GIT_BRANCH") {
+                    Some(deploy_branch) if deploy_branch == requested_branch => {
+                        let safe_branch = format!("{requested_branch}-state");
+                        tracing::warn!(
+                            deploy_branch = %deploy_branch,
+                            state_branch = %safe_branch,
+                            "GITHUB_STATE_BRANCH matches Altare's deploy branch; using a separate state branch"
+                        );
+                        safe_branch
+                    }
+                    _ => requested_branch,
+                };
+                Some(GithubSettings {
+                    token,
+                    repo,
+                    branch: state_branch,
+                    api_base: s(get, "GITHUB_API_BASE", "https://api.github.com"),
+                    seen_dir: s(get, "GITHUB_SEEN_PATH", "seen").trim_matches('/').to_string(),
+                })
+            }
             (None, None) => None,
             _ => bail!("GITHUB_TOKEN and GITHUB_REPO must be set together"),
         };
@@ -475,6 +492,24 @@ mod tests {
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("DEFAULT_CHAT_ID", "@a"), ("SUBREDDITS", "bad/name")], true).is_err());
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("DEFAULT_CHAT_ID", "@a"), ("SUBREDDITS", "a,b,c"), ("MAX_SUBREDDITS", "2")], true).is_err());
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("SPOILER_MODE", "nope")], false).is_err());
+    }
+
+    #[test]
+    fn altare_seen_state_branch_never_matches_deploy_branch() {
+        let c = cfg(
+            &[
+                ("TELEGRAM_BOT_TOKEN", "x"),
+                ("GITHUB_TOKEN", "token"),
+                ("GITHUB_REPO", "owner/repo"),
+                ("GITHUB_STATE_BRANCH", "main"),
+                ("ALTARE_GIT_BRANCH", "main"),
+                ("SUBREDDIT_1_NAME", "anime"),
+                ("SUBREDDIT_1_CHAT_ID", "@anime"),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(c.github.unwrap().branch, "main-state");
     }
 
     #[test]
