@@ -134,20 +134,37 @@ pub fn classify_media(url: &str) -> Media {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GalleryKind {
+    Photo,
+    Animation,
+    Video,
+    DashVideo,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GalleryItem {
     pub url: String,
-    pub animated: bool,
+    pub kind: GalleryKind,
 }
 
-/// Parses the post JSON (`/comments/<id>.json`) of a gallery post into ordered image URLs.
-/// URLs are rebuilt as https://i.redd.it/<media_id>.<ext> (no signed preview URLs needed).
-/// Accept only Reddit image hosts from gallery metadata. Reddit's JSON can HTML-escape
-/// ampersands in signed preview URLs; decode those before passing the URL to reqwest.
+/// Accept only Reddit-hosted media URLs. Decode HTML-escaped ampersands from raw_json.
 fn gallery_source_url(raw: &str) -> Option<String> {
     let url = raw.replace("&amp;", "&");
     [
         "https://i.redd.it/",
+        "https://preview.redd.it/",
+        "https://external-preview.redd.it/",
+    ]
+    .iter()
+    .any(|prefix| url.starts_with(prefix))
+    .then_some(url)
+}
+
+fn gallery_video_url(raw: &str) -> Option<String> {
+    let url = raw.replace("&amp;", "&");
+    [
+        "https://v.redd.it/",
         "https://preview.redd.it/",
         "https://external-preview.redd.it/",
     ]
@@ -162,6 +179,7 @@ pub fn parse_gallery(json: &str) -> Result<Vec<GalleryItem>> {
     let items = d["gallery_data"]["items"].as_array().ok_or_else(|| anyhow!("post has no gallery data"))?;
     let meta = &d["media_metadata"];
     let mut out = Vec::new();
+
     for it in items {
         let Some(id) = it["media_id"].as_str() else { continue };
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -171,30 +189,55 @@ pub fn parse_gallery(json: &str) -> Result<Vec<GalleryItem>> {
         if m["status"].as_str() != Some("valid") {
             continue;
         }
-        let ext = match m["m"].as_str().unwrap_or("") {
+
+        let media_type = m["e"].as_str().unwrap_or("");
+        let mime = m["m"].as_str().unwrap_or("");
+        let source = &m["s"];
+        let source_u = source["u"].as_str();
+        let source_mp4 = source["mp4"].as_str().and_then(gallery_video_url);
+        let source_gif = source["gif"].as_str().and_then(gallery_video_url)
+            .or_else(|| source["gif"].as_str().and_then(gallery_source_url));
+
+        // Reddit gallery video entries can expose a direct MP4, or only a DASH/HLS
+        // manifest. Prefer the MP4; ffmpeg handles the manifest fallback.
+        if media_type == "RedditVideo" || mime.starts_with("video/") {
+            if let Some(url) = source_mp4
+                .or_else(|| source_u.filter(|u| u.to_ascii_lowercase().split('?').next().unwrap_or("").ends_with(".mp4")).and_then(gallery_video_url))
+            {
+                out.push(GalleryItem { url, kind: GalleryKind::Video });
+            } else if let Some(url) = m["dashUrl"].as_str().and_then(gallery_video_url)
+                .or_else(|| m["hlsUrl"].as_str().and_then(gallery_video_url))
+            {
+                out.push(GalleryItem { url, kind: GalleryKind::DashVideo });
+            }
+            continue;
+        }
+
+        if media_type == "AnimatedImage" || mime == "image/gif" {
+            if let Some(url) = source_gif {
+                out.push(GalleryItem { url, kind: GalleryKind::Animation });
+            } else if let Some(url) = source_mp4 {
+                out.push(GalleryItem { url, kind: GalleryKind::Video });
+            } else {
+                let fallback = format!("https://i.redd.it/{id}.gif");
+                out.push(GalleryItem { url: fallback, kind: GalleryKind::Animation });
+            }
+            continue;
+        }
+
+        let ext = match mime {
             "image/jpg" | "image/jpeg" => "jpg",
             "image/png" => "png",
-            "image/gif" => "gif",
             "image/webp" => "webp",
             _ => continue,
         };
-        let animated = ext == "gif" || m["e"].as_str() == Some("AnimatedImage");
-        // Prefer Reddit's actual source URL (which may use .jpeg rather than .jpg, or
-        // include a required signed query string). Keep the ID-based URL as a fallback
-        // for older metadata that does not provide a usable source URL.
         let fallback = format!("https://i.redd.it/{id}.{ext}");
-        let url = if animated {
-            fallback
-        } else {
-            m["s"]["u"]
-                .as_str()
-                .and_then(gallery_source_url)
-                .unwrap_or(fallback)
-        };
-        out.push(GalleryItem { url, animated });
+        let url = source_u.and_then(gallery_source_url).unwrap_or(fallback);
+        out.push(GalleryItem { url, kind: GalleryKind::Photo });
     }
+
     if out.is_empty() {
-        bail!("gallery contained no usable images");
+        bail!("gallery contained no usable images or videos");
     }
     Ok(out)
 }
@@ -305,13 +348,22 @@ mod tests {
     fn gallery_links_and_json() {
         assert_eq!(classify_media("https://www.reddit.com/gallery/abc123"), Media::Gallery("abc123".into()));
         assert_eq!(classify_media("https://www.reddit.com/r/x/comments/abc/t/"), Media::None);
-        let j = r#"[{"data":{"children":[{"data":{"gallery_data":{"items":[{"media_id":"aaa"},{"media_id":"bbb"},{"media_id":"ccc"},{"media_id":"ddd"},{"media_id":"../x"}]},
-          "media_metadata":{"aaa":{"status":"valid","e":"Image","m":"image/jpg"},"bbb":{"status":"valid","e":"AnimatedImage","m":"image/gif"},
-          "ccc":{"status":"failed","m":"image/png"},"ddd":{"status":"valid","e":"Image","m":"image/png"}}}}]}}]"#;
+        let j = r#"[{"data":{"children":[{"data":{"gallery_data":{"items":[{"media_id":"aaa"},{"media_id":"bbb"},{"media_id":"ccc"},{"media_id":"ddd"},{"media_id":"vid1"},{"media_id":"vid2"},{"media_id":"../x"}]},
+          "media_metadata":{
+            "aaa":{"status":"valid","e":"Image","m":"image/jpg"},
+            "bbb":{"status":"valid","e":"AnimatedImage","m":"image/gif","s":{"gif":"https://i.redd.it/bbb.gif"}},
+            "ccc":{"status":"failed","m":"image/png"},
+            "ddd":{"status":"valid","e":"Image","m":"image/png"},
+            "vid1":{"status":"valid","e":"RedditVideo","m":"video/mp4","s":{"mp4":"https://v.redd.it/vid1/DASH_720.mp4"}},
+            "vid2":{"status":"valid","e":"RedditVideo","m":"video/mp4","dashUrl":"https://v.redd.it/link/post/asset/vid2/DASHPlaylist.mpd"}
+          }}}]}}]"#;
         let g = parse_gallery(j).unwrap();
-        assert_eq!(g.len(), 3);
-        assert_eq!(g[0], GalleryItem { url: "https://i.redd.it/aaa.jpg".into(), animated: false });
-        assert!(g[1].animated);
+        assert_eq!(g.len(), 4);
+        assert_eq!(g[0], GalleryItem { url: "https://i.redd.it/aaa.jpg".into(), kind: GalleryKind::Photo });
+        assert_eq!(g[1], GalleryItem { url: "https://i.redd.it/bbb.gif".into(), kind: GalleryKind::Animation });
+        assert_eq!(g[2], GalleryItem { url: "https://i.redd.it/ddd.png".into(), kind: GalleryKind::Photo });
+        assert_eq!(g[3], GalleryItem { url: "https://v.redd.it/vid1/DASH_720.mp4".into(), kind: GalleryKind::Video });
+
         let with_source = r#" [{"data":{"children":[{"data":{"gallery_data":{"items":[{"media_id":"source1"}]},
           "media_metadata":{"source1":{"status":"valid","e":"Image","m":"image/jpeg",
           "s":{"u":"https://preview.redd.it/source1.jpeg?width=1200&amp;format=pjpg&amp;auto=webp&amp;s=signature"}}}}}]}}]"#;
@@ -321,7 +373,6 @@ mod tests {
           "media_metadata":{"source2":{"status":"valid","e":"Image","m":"image/jpeg",
           "s":{"u":"https://evil.example/image.jpg"}}}}}]}}]"#;
         assert_eq!(parse_gallery(untrusted_source).unwrap()[0].url, "https://i.redd.it/source2.jpg");
-        assert_eq!(g[2].url, "https://i.redd.it/ddd.png");
         assert!(parse_gallery("[]").is_err());
         assert!(parse_gallery("<html>").is_err());
     }
