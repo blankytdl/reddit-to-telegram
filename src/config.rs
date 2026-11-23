@@ -73,13 +73,6 @@ pub struct Group {
     pub media_only: bool,
 }
 
-impl Group {
-    /// Posts to look at in the combined listing (Reddit allows at most 100 per page).
-    pub fn total_limit(&self) -> usize {
-        self.limits.iter().sum::<usize>().clamp(1, 100)
-    }
-}
-
 pub fn build_groups(subs: &[SubConfig], enabled: bool, max: usize) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     for s in subs {
@@ -203,8 +196,16 @@ fn add_sub(
         .or(default_chat)
         .ok_or_else(|| anyhow!("subreddit {name}: no chat id given and DEFAULT_CHAT_ID is not set"))?
         .to_string();
-    if subs.iter().any(|x| x.name.eq_ignore_ascii_case(&name) && x.chat_id == chat) {
-        return Ok(()); // exact duplicate
+    // Ignore only a truly identical entry. The same subreddit may intentionally
+    // feed one chat through both /new and /hot, or with different filtering/limits.
+    if subs.iter().any(|x| {
+        x.name.eq_ignore_ascii_case(&name)
+            && x.chat_id == chat
+            && x.sort == sort
+            && x.media_only == media_only
+            && x.limit == limit
+    }) {
+        return Ok(());
     }
     subs.push(SubConfig { name, chat_id: chat, sort, media_only, limit });
     Ok(())
@@ -404,6 +405,46 @@ mod tests {
     }
 
     #[test]
+    fn same_subreddit_can_be_configured_for_new_and_hot() {
+        let c = cfg(
+            &[
+                ("TELEGRAM_BOT_TOKEN", "x"),
+                ("DEFAULT_CHAT_ID", "@a"),
+                ("SUBREDDIT_1_NAME", "anime"),
+                ("SUBREDDIT_1_SORT", "new"),
+                ("SUBREDDIT_2_NAME", "ANIME"),
+                ("SUBREDDIT_2_SORT", "hot"),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(c.subs.len(), 2);
+        assert_eq!(c.groups.len(), 2);
+        assert_eq!(c.groups[0].sort, Sort::New);
+        assert_eq!(c.groups[1].sort, Sort::Hot);
+    }
+
+    #[test]
+    fn only_exact_duplicate_subreddit_entries_are_ignored() {
+        let c = cfg(
+            &[
+                ("TELEGRAM_BOT_TOKEN", "x"),
+                ("DEFAULT_CHAT_ID", "@a"),
+                ("SUBREDDIT_1_NAME", "anime"),
+                ("SUBREDDIT_1_SORT", "new"),
+                ("SUBREDDIT_2_NAME", "anime"),
+                ("SUBREDDIT_2_SORT", "new"),
+                ("SUBREDDIT_2_LIMIT", "20"),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(c.subs.len(), 2);
+        assert_eq!(c.subs[0].limit, 12);
+        assert_eq!(c.subs[1].limit, 20);
+    }
+
+    #[test]
     fn nsfw_is_included_by_default_and_can_be_disabled() {
         let default = cfg(&[("TELEGRAM_BOT_TOKEN", "x")], false).unwrap();
         assert!(default.include_nsfw);
@@ -434,7 +475,6 @@ mod tests {
         .unwrap();
         assert_eq!(c.groups.len(), 1);
         assert_eq!(c.groups[0].limits, vec![20, 7]);
-        assert_eq!(c.groups[0].total_limit(), 27);
         assert_eq!(c.subs[1].sort, Sort::Hot);
         assert!(!c.subs[0].media_only);
         assert_eq!(c.flush_min.as_secs(), 300);
