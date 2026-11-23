@@ -94,7 +94,7 @@ pub fn media_key(chat: &str, media: &str) -> String {
     format!("m:{:016x}", fnv64(&format!("{chat}\n{media}")))
 }
 
-/// Per-channel + subreddit key used to remember that a sub has been "seeded".
+/// Per-channel + subreddit + sort key used to remember that a feed has been seeded.
 pub fn sub_key(chat: &str, sub: &str, sort: Sort) -> String {
     format!("{chat}|{sub}|{}", sort.path()).to_ascii_lowercase()
 }
