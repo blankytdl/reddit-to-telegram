@@ -62,8 +62,8 @@ pub struct SubConfig {
     pub limit: usize,
 }
 
-/// Subreddits sharing chat/sort/media-only settings; fetched with ONE page load
-/// via Reddit's `r/a+b+c` multi-subreddit listing.
+/// Subreddits sharing chat/sort/media-only settings for scheduler processing.
+/// Each subreddit is still fetched independently to enforce its own post limit.
 #[derive(Clone, Debug)]
 pub struct Group {
     pub names: Vec<String>,
