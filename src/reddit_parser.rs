@@ -1,7 +1,7 @@
 //! Turns the JSON produced by the in-page extraction script into typed posts,
 //! detects rate-limit / block pages, and classifies media URLs.
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 struct RawPost {
@@ -39,7 +39,7 @@ struct RawPage {
     posts: Vec<RawPost>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Media {
     Image(String),
     Gif(String),
@@ -51,7 +51,7 @@ pub enum Media {
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Post {
     pub id: String,
     pub title: String,
