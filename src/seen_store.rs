@@ -300,7 +300,7 @@ mod tests {
         s.mark_sub("Foo");
         s.flush().await;
 
-        let mut s2 = SeenStore::open(p.clone(), 100).await.unwrap();
+        let s2 = SeenStore::open(p.clone(), 100).await.unwrap();
         assert!(s2.contains("t3_x"));
         assert!(s2.sub_initialized("foo"));
         assert!(!s2.contains("t3_y"));
