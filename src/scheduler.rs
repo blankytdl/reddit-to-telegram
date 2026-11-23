@@ -668,11 +668,74 @@ impl Scheduler {
         self.store.insert(&format!("{chat}|{id}"));
     }
 
+    async fn retry_pending(&mut self) {
+        const RETRY_BATCH: usize = 64;
+        let due = self.store.pending_due(unix_now(), RETRY_BATCH);
+        for mut item in due {
+            if self.token.is_cancelled() {
+                break;
+            }
+
+            let chat = item.chat.clone();
+            let id = item.post.id.clone();
+            if self.is_seen(&chat, &id) {
+                self.store.remove_pending(&chat, &id);
+                continue;
+            }
+
+            let mkey = if self.cfg.dedupe_media {
+                item.post.media.key().map(|media| media_key(&chat, media))
+            } else {
+                None
+            };
+            if mkey.as_ref().is_some_and(|key| self.store.contains(key)) {
+                self.mark_seen(&chat, &id);
+                self.store.remove_pending(&chat, &id);
+                self.store.flush().await;
+                continue;
+            }
+
+            self.health.set_stage(&format!("retrying post {id}"), 0);
+            let (gallery_index, result) = match &item.post.media {
+                Media::Gallery(gallery_id) => {
+                    self.deliver_gallery_post(&chat, &item.post, gallery_id, item.media_only, item.gallery_index).await
+                }
+                _ => (item.gallery_index, self.deliverer.deliver(&chat, &item.post, item.media_only).await),
+            };
+
+            match result {
+                Ok(()) => {
+                    self.mark_seen(&chat, &id);
+                    if let Some(key) = mkey {
+                        self.store.insert(&key);
+                    }
+                    self.store.remove_pending(&chat, &id);
+                    self.store.flush().await;
+                    info!(post = %id, "persisted retry delivered");
+                }
+                Err(error) => {
+                    item.attempts = item.attempts.saturating_add(1);
+                    let delay = delivery_retry_delay(self.cfg.interval, item.attempts);
+                    item.retry_at_unix = unix_now().saturating_add(delay.as_secs());
+                    item.gallery_index = gallery_index;
+                    self.store.upsert_pending(item.clone());
+                    self.store.flush().await;
+                    warn!(
+                        post = %id,
+                        attempt = item.attempts,
+                        retry_in_secs = delay.as_secs(),
+                        reason = %error,
+                        "persisted retry failed; keeping it queued"
+                    );
+                }
+            }
+        }
+    }
+
     async fn process_group(&mut self, g: &Group, posts: Vec<Post>) {
         self.health.set_stage(&format!("processing r/{}", g.names.join("+")), 0);
         let chat = g.chat_id.as_str();
         let fetched = posts.len();
-        let page_ok = fetched > 0;
         let mut per_sub = HashMap::<String, usize>::new();
         for p in &posts {
             let name = if p.subreddit.is_empty() { "(missing subreddit field)" } else { &p.subreddit };
@@ -684,9 +747,6 @@ impl Scheduler {
             .collect::<Vec<_>>()
             .join(",");
 
-        // Remove duplicate cards returned within the same Reddit page as well as IDs
-        // already delivered in earlier cycles. Count both cases so the logs explain
-        // why a configured subreddit may not produce a Telegram message.
         let mut batch_ids = HashSet::new();
         let (mut duplicate_in_batch, mut already_seen) = (0u32, 0u32);
         let mut fresh = Vec::with_capacity(fetched);
@@ -699,25 +759,54 @@ impl Scheduler {
                 fresh.push(p);
             }
         }
-        fresh.reverse(); // oldest first
+
+        // Reddit returns /new newest-first but /hot best-ranked-first.
+        // Reverse only /new so newly published posts are delivered chronologically.
+        if g.sort == Sort::New {
+            fresh.reverse();
+        }
         let fresh_count = fresh.len() as u32;
         if fresh_count > 0 {
-            info!(subs = %g.names.join("+"), new = fresh_count, "processing");
+            info!(subs = %g.names.join("+"), sort = g.sort.path(), new = fresh_count, "processing");
         }
+
         let (mut sent, mut seeded, mut skipped, mut retry_deferred) = (0u32, 0u32, 0u32, 0u32);
         let (mut filtered_nsfw, mut filtered_media_only, mut filtered_spoiler, mut duplicate_media, mut failed) =
             (0u32, 0u32, 0u32, 0u32, 0u32);
 
+        // Track first-run initialization separately for /new and /hot. Seed every
+        // post in each new stream before marking it initialized, including when the
+        // listing is empty. This prevents a restart mid-loop from losing posts.
+        let uninitialized: HashSet<String> = g.names.iter()
+            .filter(|name| !self.store.sub_known(chat, name, g.sort.path()))
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        if !self.cfg.send_backlog && !uninitialized.is_empty() {
+            let mut seeded_ids = HashSet::new();
+            for post in &fresh {
+                let sub = if post.subreddit.is_empty() { g.names[0].as_str() } else { post.subreddit.as_str() };
+                if uninitialized.contains(&sub.to_ascii_lowercase()) {
+                    self.mark_seen(chat, &post.id);
+                    seeded_ids.insert(post.id.clone());
+                    seeded += 1;
+                }
+            }
+            fresh.retain(|post| !seeded_ids.contains(&post.id));
+        }
+        for name in &g.names {
+            self.store.mark_sub(&sub_key(chat, name, g.sort));
+        }
+
         for p in fresh {
             if self.token.is_cancelled() {
-                return; // subs stay un-marked; nothing is lost, unsent posts are retried next run
+                return; // unprocessed posts remain unseen and will be picked up next cycle
             }
             let sub = if p.subreddit.is_empty() { g.names[0].as_str() } else { p.subreddit.as_str() };
             self.health.set_stage(&format!("post {} from r/{sub}", p.id), 0);
-            // First run for this sub+channel: remember what exists, don't flood the channel.
-            if !self.cfg.send_backlog && !self.store.sub_known(chat, sub) {
-                self.mark_seen(chat, &p.id);
-                seeded += 1;
+
+            // Queued items are retried once per cycle independently of the Reddit listing.
+            if self.store.has_pending(chat, &p.id) {
+                retry_deferred += 1;
                 continue;
             }
             if p.nsfw && !self.cfg.include_nsfw {
@@ -726,9 +815,10 @@ impl Scheduler {
                 skipped += 1;
                 continue;
             }
-            // When NSFW is enabled, keep flagged posts even if MEDIA_ONLY is on.
-            // Unsupported external media is still sent as its Reddit post link.
-            if g.media_only && p.media == Media::None && !(p.nsfw && self.cfg.include_nsfw) {
+            // Keep unsupported external links in media-only feeds; skip only actual
+            // text/self posts that have no external source URL at all.
+            if g.media_only && p.media == Media::None && p.source_url.is_empty()
+                && !(p.nsfw && self.cfg.include_nsfw) {
                 self.mark_seen(chat, &p.id);
                 filtered_media_only += 1;
                 skipped += 1;
@@ -750,25 +840,11 @@ impl Scheduler {
                     continue;
                 }
             }
-            let retry_key = format!("{chat}|{}", p.id);
-            if let Some((attempts, retry_at)) = self.fail_counts.get(&retry_key) {
-                let now = Instant::now();
-                if *retry_at > now {
-                    retry_deferred += 1;
-                    debug!(
-                        post = %p.id,
-                        previous_attempts = *attempts,
-                        retry_in_secs = (*retry_at - now).as_secs(),
-                        "delivery retry deferred"
-                    );
-                    continue;
-                }
-            }
 
             info!(sub = %sub, post = %p.id, "delivery started");
-            let result = match &p.media {
-                Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id, g.media_only).await,
-                _ => self.deliverer.deliver(chat, &p, g.media_only).await,
+            let (gallery_index, result) = match &p.media {
+                Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id, g.media_only, 0).await,
+                _ => (0, self.deliverer.deliver(chat, &p, g.media_only).await),
             };
             match result {
                 Ok(()) => {
@@ -777,40 +853,37 @@ impl Scheduler {
                     if let Some(k) = mkey {
                         self.store.insert(&k);
                     }
-                    self.fail_counts.remove(&retry_key);
+                    self.store.remove_pending(chat, &p.id);
                     sent += 1;
                 }
-                Err(e) => {
+                Err(error) => {
                     failed += 1;
-                    if self.fail_counts.len() > 1000 {
-                        self.fail_counts.clear();
-                    }
-                    let (attempt, delay) = {
-                        let state = self.fail_counts
-                            .entry(retry_key.clone())
-                            .or_insert((0, Instant::now()));
-                        state.0 = state.0.saturating_add(1);
-                        let delay = delivery_retry_delay(self.cfg.interval, state.0);
-                        state.1 = Instant::now() + delay;
-                        (state.0, delay)
-                    };
+                    let delay = delivery_retry_delay(self.cfg.interval, 1);
+                    self.store.upsert_pending(PendingDelivery {
+                        chat: chat.to_string(),
+                        post: p.clone(),
+                        media_only: g.media_only,
+                        attempts: 1,
+                        retry_at_unix: unix_now().saturating_add(delay.as_secs()),
+                        gallery_index,
+                    });
+                    // Persist failures immediately: a process restart must not erase
+                    // the retry queue or a gallery's resume position.
+                    self.store.flush().await;
                     warn!(
                         sub = %sub,
                         post = %p.id,
-                        attempt,
+                        attempt = 1,
                         retry_in_secs = delay.as_secs(),
-                        "delivery failed; post remains unseen and will be retried"
+                        reason = %error,
+                        "delivery failed; persisted retry queued"
                     );
                 }
             }
         }
-        if page_ok {
-            for name in &g.names {
-                self.store.mark_sub(&sub_key(chat, name));
-            }
-        }
         info!(
             subs = %g.names.join("+"),
+            sort = g.sort.path(),
             fetched,
             per_sub = %per_sub,
             fresh = fresh_count,
