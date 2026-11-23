@@ -45,7 +45,15 @@ pub const EXTRACT_JS: &str = r#"(() => {
 })()"#;
 
 /// Returns the raw page text (used to read a post's JSON document in the browser).
-pub const TEXT_JS: &str = "fetch(location.href, { credentials: 'include', headers: { Accept: 'application/json' } }).then(r => r.text())";
+pub const TEXT_JS: &str = r#"(() => {
+  // JSON document navigations are rendered as a <pre>. Read the document itself
+  // instead of issuing a second fetch (which can return an HTML error page).
+  const pre = document.querySelector('pre');
+  const fromPre = pre && (pre.innerText || pre.textContent);
+  const body = document.body && (document.body.innerText || document.body.textContent);
+  const root = document.documentElement && (document.documentElement.innerText || document.documentElement.textContent);
+  return String(fromPre || body || root || '').trim();
+})()"#;
 
 struct Cdp {
     ws: Ws,
