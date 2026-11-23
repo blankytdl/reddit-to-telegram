@@ -99,6 +99,13 @@ pub fn sub_key(chat: &str, sub: &str, sort: Sort) -> String {
     format!("{chat}|{sub}|{}", sort.path()).to_ascii_lowercase()
 }
 
+fn delivery_order(mut posts: Vec<Post>, sort: Sort) -> Vec<Post> {
+    if sort == Sort::New {
+        posts.reverse();
+    }
+    posts
+}
+
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
@@ -762,9 +769,7 @@ impl Scheduler {
 
         // Reddit returns /new newest-first but /hot best-ranked-first.
         // Reverse only /new so newly published posts are delivered chronologically.
-        if g.sort == Sort::New {
-            fresh.reverse();
-        }
+        fresh = delivery_order(fresh, g.sort);
         let fresh_count = fresh.len() as u32;
         if fresh_count > 0 {
             info!(subs = %g.names.join("+"), sort = g.sort.path(), new = fresh_count, "processing");
@@ -955,8 +960,17 @@ mod tests {
     fn media_key_is_stable_and_channel_scoped() {
         assert_eq!(media_key("@a", "https://i.redd.it/x.png"), media_key("@a", "https://i.redd.it/x.png"));
         assert_ne!(media_key("@a", "https://i.redd.it/x.png"), media_key("@b", "https://i.redd.it/x.png"));
-        assert_eq!(sub_key("@a", "Anime"), "@a|anime");
-        assert_eq!(sub_key("@AnimeChannel", "Anime"), "@animechannel|anime");
+        assert_eq!(sub_key("@a", "Anime", Sort::New), "@a|anime|new");
+        assert_eq!(sub_key("@AnimeChannel", "Anime", Sort::Hot), "@animechannel|anime|hot");
+    }
+
+    #[test]
+    fn new_posts_are_chronological_but_hot_keeps_rank_order() {
+        let posts = vec![post("top", false), post("next", false), post("last", false)];
+        let hot = delivery_order(posts.clone(), Sort::Hot);
+        assert_eq!(hot.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(), vec!["top", "next", "last"]);
+        let new = delivery_order(posts, Sort::New);
+        assert_eq!(new.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(), vec!["last", "next", "top"]);
     }
 
     #[test]
