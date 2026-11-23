@@ -74,7 +74,7 @@ pub fn next_penalty(prev: Duration) -> Duration {
 
 /// Keep failed posts eligible for retry, with per-post exponential backoff.
 fn delivery_retry_delay(interval: Duration, attempts: u8) -> Duration {
-    let shift = attempts.saturating_sub(1).min(5);
+    let shift = attempts.saturating_sub(1).min(6);
     interval
         .saturating_mul(1u32 << shift)
         .min(Duration::from_secs(6 * 60 * 60))
