@@ -4,7 +4,7 @@ use crate::{
     media_downloader as md,
     reddit_browser::Browser,
     reddit_parser::{parse_gallery, parse_page, GalleryItem, GalleryKind, Media, PageStatus, Post},
-    seen_store::SeenStore,
+    seen_store::{PendingDelivery, SeenStore},
     telegram::{FileKind, Telegram, TgError},
 };
 use anyhow::{bail, Result};
@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::{sleep, timeout, Instant};
 use tokio_util::sync::CancellationToken;
@@ -95,8 +95,12 @@ pub fn media_key(chat: &str, media: &str) -> String {
 }
 
 /// Per-channel + subreddit key used to remember that a sub has been "seeded".
-pub fn sub_key(chat: &str, sub: &str) -> String {
-    format!("{chat}|{sub}").to_ascii_lowercase()
+pub fn sub_key(chat: &str, sub: &str, sort: Sort) -> String {
+    format!("{chat}|{sub}|{}", sort.path()).to_ascii_lowercase()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 fn retry_as_document(e: &TgError, kind: FileKind) -> bool {
@@ -431,7 +435,6 @@ pub struct Scheduler {
     deliverer: Deliverer,
     health: Arc<Health>,
     token: CancellationToken,
-    fail_counts: HashMap<String, (u8, Instant)>,
     cycles: u64,
     penalty: Duration,
     next_group: usize,
@@ -439,7 +442,7 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(cfg: Arc<Config>, browser: Browser, store: SeenStore, deliverer: Deliverer, health: Arc<Health>, token: CancellationToken) -> Self {
-        Self { cfg, browser, store, deliverer, health, token, fail_counts: HashMap::new(), cycles: 0, penalty: Duration::ZERO, next_group: 0 }
+        Self { cfg, browser, store, deliverer, health, token, cycles: 0, penalty: Duration::ZERO, next_group: 0 }
     }
 
     pub async fn run(mut self) {
