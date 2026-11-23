@@ -181,101 +181,94 @@ impl Deliverer {
         }
     }
 
-    async fn fetch_photo(&self, url: &str) -> Option<(md::TempFile, u64)> {
-        let tf = match md::download(&self.http, url, GALLERY_ITEM_MAX, &md::ext_of(url)).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(reason = %e, "gallery image skipped");
-                return None;
-            }
-        };
+    async fn fetch_photo(&self, url: &str) -> Result<(md::TempFile, u64)> {
+        let tf = md::download(&self.http, url, GALLERY_ITEM_MAX, &md::ext_of(url)).await?;
         let size = tf.size().await;
         if size <= self.cfg.max_photo_bytes {
-            return Some((tf, size));
+            return Ok((tf, size));
         }
-        match self.shrink(tf.path()).await {
-            Some(s) => {
-                let sz = s.size().await;
-                Some((s, sz))
-            }
-            None => {
-                warn!("gallery image too large and cannot be resized; skipped");
-                None
-            }
-        }
+        let resized = self.shrink(tf.path()).await
+            .ok_or_else(|| anyhow::anyhow!("gallery image too large and could not be resized"))?;
+        let resized_size = resized.size().await;
+        Ok((resized, resized_size))
     }
 
-    async fn send_album(&self, c: &Ctx<'_>, files: &[(md::TempFile, u64)], cap: &str) -> Result<()> {
+    /// Returns how many leading photos were confirmed sent, so a failed gallery
+    /// can resume without repeating already delivered photos.
+    async fn send_album(&self, c: &Ctx<'_>, files: &[(md::TempFile, u64)], cap: &str) -> (usize, Result<()>) {
         let one = |cap: &str| Ctx { chat: c.chat, p: c.p, cap: cap.to_string(), spoiler: c.spoiler, media_only: c.media_only };
         if files.len() == 1 {
-            return self.upload_photo(&one(cap), files[0].0.path(), files[0].1).await;
+            return match self.upload_photo(&one(cap), files[0].0.path(), files[0].1).await {
+                Ok(()) => (1, Ok(())),
+                Err(e) => (0, Err(e)),
+            };
         }
         let paths: Vec<&Path> = files.iter().map(|(t, _)| t.path()).collect();
         self.pace_n(c.chat, paths.len() as u32).await;
         match self.tg.send_media_group(c.chat, &paths, cap, c.spoiler).await {
-            Ok(()) => Ok(()),
+            Ok(()) => (files.len(), Ok(())),
             Err(e) if retry_as_document(&e, FileKind::Photo) => {
                 warn!("telegram rejected album ({}); sending images one by one", e.desc);
-                for (i, (t, s)) in files.iter().enumerate() {
-                    self.upload_photo(&one(if i == 0 { cap } else { "" }), t.path(), *s).await?;
+                for (i, (t, size)) in files.iter().enumerate() {
+                    if let Err(err) = self.upload_photo(&one(if i == 0 { cap } else { "" }), t.path(), *size).await {
+                        return (i, Err(err));
+                    }
                 }
-                Ok(())
+                (files.len(), Ok(()))
             }
-            Err(e) => Err(e.into()),
+            Err(e) => (0, Err(e.into())),
         }
     }
 
     /// Sends every item in a Reddit gallery in its original order:
     /// photos in albums, GIFs as animations, and Reddit videos as videos.
-    pub async fn deliver_gallery(&self, chat: &str, p: &Post, items: &[GalleryItem]) -> Result<()> {
+    /// Sends gallery items in order. On failure, the returned index points to the
+    /// first item not confirmed sent; the scheduler persists it for restart-safe resume.
+    pub async fn deliver_gallery(
+        &self,
+        chat: &str,
+        p: &Post,
+        items: &[GalleryItem],
+        start_index: usize,
+    ) -> (usize, Result<()>) {
         let spoiler = p.spoiler && self.cfg.spoiler_mode == SpoilerMode::Mark;
         let cap = caption(p, spoiler, self.cfg.caption);
         let c = Ctx { chat, p, cap: cap.clone(), spoiler, media_only: true };
-        let mut sent_any = false;
-        let mut cap_used = false;
-        let mut index = 0usize;
+        let mut index = start_index.min(items.len());
+        let mut cap_used = index > 0;
 
         while index < items.len() {
             if items[index].kind == GalleryKind::Photo {
-                // Keep photo albums ordered and capped at Telegram's 10-item album limit.
                 let start = index;
-                while index < items.len()
-                    && index - start < 10
-                    && items[index].kind == GalleryKind::Photo
-                {
-                    index += 1;
+                let mut end = start;
+                while end < items.len() && end - start < 10 && items[end].kind == GalleryKind::Photo {
+                    end += 1;
                 }
 
-                let mut files = Vec::with_capacity(index - start);
-                for it in &items[start..index] {
-                    if let Some(file) = self.fetch_photo(&it.url).await {
-                        files.push(file);
+                let mut files = Vec::with_capacity(end - start);
+                for item in &items[start..end] {
+                    match self.fetch_photo(&item.url).await {
+                        Ok(file) => files.push(file),
+                        Err(e) => return (start, Err(e)),
                     }
                 }
-                if files.is_empty() {
-                    continue;
-                }
+
                 let chunk_cap = if cap_used { "" } else { cap.as_str() };
-                match self.send_album(&c, &files, chunk_cap).await {
-                    Ok(()) => {
-                        sent_any = true;
-                        cap_used = true;
-                    }
-                    Err(e) if sent_any => {
-                        warn!(post = %p.id, "gallery photo album failed after earlier items were sent: {e:#}");
-                    }
-                    Err(e) => return Err(e),
+                let (sent, result) = self.send_album(&c, &files, chunk_cap).await;
+                if let Err(e) = result {
+                    return (start + sent, Err(e));
                 }
+                index = end;
+                cap_used = true;
                 continue;
             }
 
-            let item = &items[index];
-            index += 1;
-            let item_cap = if cap_used { String::new() } else { cap.clone() };
+            let item_index = index;
+            let item = &items[item_index];
             let item_ctx = Ctx {
                 chat,
                 p,
-                cap: item_cap,
+                cap: if cap_used { String::new() } else { cap.clone() },
                 spoiler,
                 media_only: true,
             };
@@ -285,23 +278,14 @@ impl Deliverer {
                 GalleryKind::DashVideo => self.gallery_video_manifest(&item_ctx, &item.url).await,
                 GalleryKind::Photo => unreachable!("photo items are sent in albums"),
             };
-            match result {
-                Ok(()) => {
-                    sent_any = true;
-                    cap_used = true;
-                }
-                Err(e) if sent_any => {
-                    warn!(post = %p.id, url = %item.url, "gallery media item failed after earlier items were sent: {e:#}");
-                }
-                Err(e) => return Err(e),
+            if let Err(e) = result {
+                return (item_index, Err(e));
             }
+            index += 1;
+            cap_used = true;
         }
 
-        if sent_any {
-            Ok(())
-        } else {
-            bail!("no gallery item could be delivered")
-        }
+        (index, Ok(()))
     }
 
     async fn gallery_video_manifest(&self, c: &Ctx<'_>, url: &str) -> Result<()> {
