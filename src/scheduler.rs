@@ -497,13 +497,15 @@ impl Scheduler {
     }
 
     async fn cycle(&mut self) -> Result<()> {
+        // Retry old failures first, but count that work against this cycle's time budget.
+        let started = Instant::now();
         self.retry_pending().await;
         let cfg = self.cfg.clone();
         let n = cfg.groups.len();
         if n == 0 {
             return Ok(());
         }
-        let started = Instant::now();
+        let start_group = self.next_group % n;
         let (mut limited, mut done) = (false, 0usize);
         for k in 0..n {
             if self.token.is_cancelled() {
@@ -514,7 +516,9 @@ impl Scheduler {
                 warn!(done, total = n, "cycle time budget reached; remaining groups run next cycle (raise POLL_INTERVAL_SECS or reduce subs)");
                 break;
             }
-            let gi = (self.next_group + k) % n;
+            // Use a stable starting offset. next_group is updated as work completes;
+            // reading it here as well would advance twice and skip groups.
+            let gi = (start_group + k) % n;
             let g = &cfg.groups[gi];
             if k > 0 {
                 sleep(cfg.request_gap).await;
@@ -676,7 +680,7 @@ impl Scheduler {
     }
 
     async fn retry_pending(&mut self) {
-        const RETRY_BATCH: usize = 64;
+        const RETRY_BATCH: usize = 8;
         let due = self.store.pending_due(unix_now(), RETRY_BATCH);
         for mut item in due {
             if self.token.is_cancelled() {
