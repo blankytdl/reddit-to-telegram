@@ -79,7 +79,7 @@ items were sent, the retry resumes at the first item not confirmed sent rather t
 `/comments/<id>.json` document **in the same browser** (one extra page load per gallery post — still browser-based, but it is
 Reddit's unofficial JSON view, not an API client; it is a separate step you may want to know about). Image URLs are rebuilt as
 `i.redd.it/<media_id>.<ext>`. Oversized images are resized like normal photos; animated items are sent as separate animations
-after the album. If the configured Reddit host does not return gallery JSON, the bot retries the request against the other canonical Reddit host. In media-only mode, unresolved galleries never fall back to a plain link: the post stays unseen and is retried with per-post exponential backoff. Outside media-only mode, the original-post link remains the fallback. If an album or item fails after earlier items were confirmed sent, the pending retry stores the next item index and resumes there rather than replaying earlier items. Untested: whether Lightpanda renders that JSON view as
+after the album. If the configured Reddit host does not return gallery JSON, the bot retries the request against the other canonical Reddit host. In media-only mode, unresolved galleries never fall back to a plain link: the post stays unseen and is retried with per-post exponential backoff. Outside media-only mode, the original-post link remains the fallback. When an album/item fails after earlier items were confirmed sent, the pending retry stores the next item index and resumes from that point. Untested: whether Lightpanda renders that JSON view as
 readable text, and whether Reddit rate-limits these extra loads.
 
 ## Behaviour you should know
