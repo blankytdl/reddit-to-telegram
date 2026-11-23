@@ -196,15 +196,15 @@ fn add_sub(
         .or(default_chat)
         .ok_or_else(|| anyhow!("subreddit {name}: no chat id given and DEFAULT_CHAT_ID is not set"))?
         .to_string();
-    // Ignore only a truly identical entry. The same subreddit may intentionally
-    // feed one chat through both /new and /hot, or with different filtering/limits.
-    if subs.iter().any(|x| {
+    // Keep distinct sort/filter streams, but collapse duplicate entries for the
+    // same stream and retain the largest requested limit.
+    if let Some(existing) = subs.iter_mut().find(|x| {
         x.name.eq_ignore_ascii_case(&name)
             && x.chat_id == chat
             && x.sort == sort
             && x.media_only == media_only
-            && x.limit == limit
     }) {
+        existing.limit = existing.limit.max(limit);
         return Ok(());
     }
     subs.push(SubConfig { name, chat_id: chat, sort, media_only, limit });
@@ -439,9 +439,8 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(c.subs.len(), 2);
-        assert_eq!(c.subs[0].limit, 12);
-        assert_eq!(c.subs[1].limit, 20);
+        assert_eq!(c.subs.len(), 1);
+        assert_eq!(c.subs[0].limit, 20);
     }
 
     #[test]
