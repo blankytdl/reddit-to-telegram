@@ -32,9 +32,11 @@ INCLUDE_NSFW=true                               # send Reddit-marked 18+ posts
 SPOILER_MODE=mark                               # mark | skip | ignore
 ```
 - **Many subs, one channel:** `SUBREDDITS` (comma list; `name=@chat` overrides the channel) and/or numbered
-  `SUBREDDIT_n_*` vars. Subs with the same channel/sort/media-only settings are fetched in **one page load** via
-  `r/a+b+c` (`GROUP_MAX_SUBS`, default 8), so 30 subs ≈ 4 page loads instead of 30. If a combined page comes back empty
-  the bot retries each sub separately. The same image/video posted in several subs is sent to a channel once (`DEDUPE_MEDIA`).
+  `SUBREDDIT_n_*` vars. Subs with the same channel/sort/media-only settings are grouped for scheduler processing
+  (`GROUP_MAX_SUBS`, default 8), but Reddit is queried **separately for every subreddit** using that sub's own limit.
+  This costs one page load per subreddit, but prevents a high-volume community from consuming the combined listing cap
+  and hiding posts from quieter communities. `GROUP_REQUESTS=false` schedules each subreddit as its own group.
+  The same image/video posted in several subs is sent to a channel once (`DEDUPE_MEDIA`).
 - **Media only:** `MEDIA_ONLY=true` (global) or `SUBREDDIT_n_MEDIA_ONLY` (per sub) drops ordinary text/link posts. Reddit-marked NSFW posts are still forwarded when `INCLUDE_NSFW=true`; unsupported external media is sent as the Reddit post link.
 - **NSFW:** `INCLUDE_NSFW=true` (default) keeps posts Reddit marks with its `over18`/NSFW listing marker. The browser still needs a valid `REDDIT_SESSION_COOKIE` from an account authorized to view mature content; enable the mature-content preference on Reddit and Old Reddit before copying the session cookie. This does not bypass Reddit age checks or restrictions.
 - **Separate files:** seen IDs are stored at `/home/container/data/seen_posts.json`; console logs are also written to `/home/container/logs/bot.log` (with one `.log.1` backup at 5 MiB). Set `STATE_PATH` and `LOG_PATH` independently to change these locations.
@@ -52,7 +54,8 @@ SPOILER_MODE=mark                               # mark | skip | ignore
 ## Migrating from the Python bot (reference repo)
 - **Env vars carry over unchanged:** `TELEGRAM_BOT_TOKEN`, `SUBREDDIT_<N>_NAME/_CHAT_ID/_SORT/_LIMIT`, `SUBREDDIT_DEFAULT_SORT/_LIMIT`
   (default limit 12), `SKIP_TEXT_ONLY_POSTS` (default `true`, = `MEDIA_ONLY`), `BLUR_SPOILERS`, `MAX_MEDIA_DOWNLOAD_BYTES`, plus `INCLUDE_TITLE/_FOOTER/_REDDIT_LINK`
-  (these three were hardcoded in `config.py`; now env vars). Per-sub `_LIMIT` is honoured; grouped subs load `sum(limits)` posts (max 100).
+  (these three were hardcoded in `config.py`; now env vars). Each subreddit is fetched independently and its own
+  `_LIMIT` is honoured; there is no shared combined-page limit.
 - **Local state only:** existing host state is loaded from `STATE_PATH`. There is no GitHub API integration or remote backup. Back up the JSON file yourself before deleting or recreating the server. If the state file is missing, the first run seeds existing Reddit posts instead of sending the whole backlog (`SEND_BACKLOG_ON_FIRST_RUN=true` changes this).
 - **Same caption layout:** title / `r/sub • u/author` / "Open on Reddit" link. Spoiler detection keeps the Python heuristics
   (title `[spoiler`/`(spoiler)`, flair) plus old.reddit's spoiler stamp. Seen-tracking is per destination channel, like `channel_seen`.
@@ -71,7 +74,8 @@ processing in the bot and costs a few CPU-seconds at 0.1 CPU, only for oversized
 
 ## Reddit galleries
 Gallery posts (`reddit.com/gallery/<id>`) are sent as photo **albums**, in gallery order, 10 per album (galleries of 11–20 images
-become two albums); the title/caption sits on the first album. To learn the image list the bot opens the post's
+become two albums); the title/caption sits on the first album. If a later album or item fails after earlier
+items were sent, the retry resumes at the first item not confirmed sent rather than re-sending earlier items. To learn the image list the bot opens the post's
 `/comments/<id>.json` document **in the same browser** (one extra page load per gallery post — still browser-based, but it is
 Reddit's unofficial JSON view, not an API client; it is a separate step you may want to know about). Image URLs are rebuilt as
 `i.redd.it/<media_id>.<ext>`. Oversized images are resized like normal photos; animated items are sent as separate animations
@@ -80,11 +84,13 @@ an earlier one was sent, the post is still marked done to avoid re-sending. Unte
 readable text, and whether Reddit rate-limits these extra loads.
 
 ## Behaviour you should know
-- **First run seeds, doesn't flood.** For each subreddit+channel with no history, existing posts are recorded as seen and
-  *not* sent (`SEND_BACKLOG_ON_FIRST_RUN=true` to change).
+- **First run seeds, doesn't flood.** For each subreddit+channel+sort stream with no history, existing posts are
+  recorded as seen and *not* sent (`SEND_BACKLOG_ON_FIRST_RUN=true` to change).
 - If the local state file is corrupt or cannot be read, the bot **exits** rather than silently resetting deduplication history.
   If the state file is missing, the first run seeds existing Reddit posts instead of sending the whole backlog.
-- Posts are marked seen only after successful delivery or an intentional filter/first-run seed. Failed deliveries stay unseen and are retried with per-post exponential backoff (based on the poll interval, capped at 6 hours); restarting the process clears the in-memory retry delay but does not lose the unseen post.
+- Posts are marked seen only after successful delivery or an intentional filter/first-run seed. Failed deliveries are
+  stored in the local state file with per-post exponential backoff (based on the poll interval, capped at 6 hours).
+  Retries survive process restarts and continue even after a post drops out of the current Reddit listing.
 - Media: photo → `sendPhoto` (oversized/rejected → resized, still a photo; document only as last resort); GIF → `sendAnimation`;
   MP4 / v.redd.it → `sendVideo`. Over 50 MB or undownloadable → a link message. Galleries, text posts and
   other hosts are sent as links. Downloads only from `i.redd.it`, `preview.redd.it`, `v.redd.it`, `i.imgur.com` over https.
