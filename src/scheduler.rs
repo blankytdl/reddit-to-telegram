@@ -490,19 +490,20 @@ impl Scheduler {
     }
 
     async fn cycle(&mut self) -> Result<()> {
+        self.retry_pending().await;
         let cfg = self.cfg.clone();
         let n = cfg.groups.len();
         if n == 0 {
             return Ok(());
         }
         let started = Instant::now();
-        let (mut limited, mut done, mut longest) = (false, 0usize, Duration::ZERO);
+        let (mut limited, mut done) = (false, 0usize);
         for k in 0..n {
             if self.token.is_cancelled() {
                 break;
             }
             // Time budget: stop starting page loads we can't finish; resume round-robin next cycle.
-            if k > 0 && started.elapsed() + longest > cfg.cycle_budget {
+            if k > 0 && started.elapsed() > cfg.cycle_budget {
                 warn!(done, total = n, "cycle time budget reached; remaining groups run next cycle (raise POLL_INTERVAL_SECS or reduce subs)");
                 break;
             }
@@ -511,7 +512,6 @@ impl Scheduler {
             if k > 0 {
                 sleep(cfg.request_gap).await;
             }
-            let t0 = Instant::now();
             self.health.set_stage(&format!("fetching r/{}", g.names.join("+")), 0);
             match self.fetch_group(g).await {
                 Ok(Some(posts)) => {
@@ -532,7 +532,6 @@ impl Scheduler {
                     done += 1;
                 }
             }
-            longest = longest.max(t0.elapsed());
         }
         self.health.set_stage("flushing cycle state", 0);
         // Respect the configured sync interval. A forced flush is still done on shutdown.
@@ -542,28 +541,29 @@ impl Scheduler {
         Ok(())
     }
 
-    /// One multi-subreddit page load; falls back to per-sub loads if the combined page is empty.
+    /// Fetch each subreddit separately so a busy subreddit cannot consume another
+    /// subreddit's configured post limit.
     async fn fetch_group(&mut self, g: &Group) -> Result<Option<Vec<Post>>> {
-        let limit = g.total_limit();
-        let posts = match self.fetch_listing(&g.names, g.sort, limit).await? {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        if !posts.is_empty() || g.names.len() == 1 {
-            return Ok(Some(posts));
-        }
-        warn!(subs = %g.names.join("+"), "combined listing was empty; retrying each subreddit separately");
         let mut all = Vec::new();
-        for (name, lim) in g.names.iter().zip(&g.limits) {
+        for (index, (name, limit)) in g.names.iter().zip(&g.limits).enumerate() {
             if self.token.is_cancelled() {
-                break;
+                return Ok(None);
             }
-            sleep(self.cfg.request_gap).await;
-            match self.fetch_listing(std::slice::from_ref(name), g.sort, *lim).await {
-                Ok(Some(p)) => all.extend(p),
-                Ok(None) => return Ok(None),
-                Err(e) => warn!(sub = %name, "fetch failed: {e:#}"),
+            if index > 0 {
+                sleep(self.cfg.request_gap).await;
             }
+            let mut posts = match self.fetch_listing(std::slice::from_ref(name), g.sort, *limit).await? {
+                Some(posts) => posts,
+                None => return Ok(None),
+            };
+            // A single-subreddit request makes the source unambiguous even when
+            // Reddit omits the card's data-subreddit field.
+            for post in &mut posts {
+                if post.subreddit.is_empty() {
+                    post.subreddit = name.clone();
+                }
+            }
+            all.extend(posts);
         }
         Ok(Some(all))
     }
@@ -597,7 +597,14 @@ impl Scheduler {
 
     /// Read gallery metadata from Reddit's JSON document. If the configured host
     /// returns an HTML shell/error page, try the other canonical Reddit host.
-    async fn deliver_gallery_post(&mut self, chat: &str, p: &Post, id: &str, media_only: bool) -> Result<()> {
+    async fn deliver_gallery_post(
+        &mut self,
+        chat: &str,
+        p: &Post,
+        id: &str,
+        media_only: bool,
+        start_index: usize,
+    ) -> (usize, Result<()>) {
         sleep(self.cfg.request_gap).await;
 
         let primary_base = self.cfg.reddit_base.trim_end_matches('/');
@@ -631,7 +638,7 @@ impl Scheduler {
             }
 
             match parse_gallery(&body) {
-                Ok(items) => return self.deliverer.deliver_gallery(chat, p, &items).await,
+                Ok(items) => return self.deliverer.deliver_gallery(chat, p, &items, start_index).await,
                 Err(e) => {
                     let prefix = body.trim().chars().take(120).collect::<String>().replace('\n', " ");
                     last_error = Some(anyhow::anyhow!("{e:#}; response prefix: {prefix:?}"));
@@ -642,14 +649,12 @@ impl Scheduler {
         let error = last_error.unwrap_or_else(|| anyhow::anyhow!("Reddit returned no gallery metadata"));
         warn!(post = %p.id, media_only, reason = %error, "gallery media could not be resolved");
 
-        // A media-only feed must never turn a failed media extraction into a
-        // plain Reddit-link post. Returning Err leaves the ID unseen for retry.
         if media_only {
-            Err(anyhow::anyhow!("gallery extraction failed; post remains unseen for retry: {error:#}"))
+            (start_index, Err(anyhow::anyhow!("gallery extraction failed; post remains unseen for retry: {error:#}")))
         } else {
-            self.deliverer
+            (start_index, self.deliverer
                 .deliver_link(chat, p, "Gallery media could not be loaded; open the original post.")
-                .await
+                .await)
         }
     }
 
