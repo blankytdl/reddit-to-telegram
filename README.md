@@ -37,7 +37,7 @@ SPOILER_MODE=mark                               # mark | skip | ignore
   This costs one page load per subreddit, but prevents a high-volume community from consuming the combined listing cap
   and hiding posts from quieter communities. `GROUP_REQUESTS=false` schedules each subreddit as its own group.
   The same image/video posted in several subs is sent to a channel once (`DEDUPE_MEDIA`).
-- **Media only:** `MEDIA_ONLY=true` (global) or `SUBREDDIT_n_MEDIA_ONLY` (per sub) drops ordinary text/link posts. Reddit-marked NSFW posts are still forwarded when `INCLUDE_NSFW=true`; unsupported external media is sent as the Reddit post link.
+- **Media only:** `MEDIA_ONLY=true` (global) or `SUBREDDIT_n_MEDIA_ONLY` (per sub) drops text/self posts with no external URL. Reddit-marked NSFW posts are still forwarded when `INCLUDE_NSFW=true`; external URLs that the downloader does not support are sent as the Reddit post link.
 - **NSFW:** `INCLUDE_NSFW=true` (default) keeps posts Reddit marks with its `over18`/NSFW listing marker. The browser still needs a valid `REDDIT_SESSION_COOKIE` from an account authorized to view mature content; enable the mature-content preference on Reddit and Old Reddit before copying the session cookie. This does not bypass Reddit age checks or restrictions.
 - **Separate files:** seen IDs are stored at `/home/container/data/seen_posts.json`; console logs are also written to `/home/container/logs/bot.log` (with one `.log.1` backup at 5 MiB). Set `STATE_PATH` and `LOG_PATH` independently to change these locations.
 - **Spoilers:** posts flagged as spoilers are sent with Telegram's spoiler overlay (`has_spoiler`) and the title in a
@@ -79,8 +79,7 @@ items were sent, the retry resumes at the first item not confirmed sent rather t
 `/comments/<id>.json` document **in the same browser** (one extra page load per gallery post — still browser-based, but it is
 Reddit's unofficial JSON view, not an API client; it is a separate step you may want to know about). Image URLs are rebuilt as
 `i.redd.it/<media_id>.<ext>`. Oversized images are resized like normal photos; animated items are sent as separate animations
-after the album. If the configured Reddit host does not return gallery JSON, the bot retries the request against the other canonical Reddit host. In media-only mode, unresolved galleries never fall back to a plain link: the post stays unseen and is retried with per-post exponential backoff. Outside media-only mode, the original-post link remains the fallback. If an album fails after
-an earlier one was sent, the post is still marked done to avoid re-sending. Untested: whether Lightpanda renders that JSON view as
+after the album. If the configured Reddit host does not return gallery JSON, the bot retries the request against the other canonical Reddit host. In media-only mode, unresolved galleries never fall back to a plain link: the post stays unseen and is retried with per-post exponential backoff. Outside media-only mode, the original-post link remains the fallback. If an album or item fails after earlier items were confirmed sent, the pending retry stores the next item index and resumes there rather than replaying earlier items. Untested: whether Lightpanda renders that JSON view as
 readable text, and whether Reddit rate-limits these extra loads.
 
 ## Behaviour you should know
@@ -92,8 +91,7 @@ readable text, and whether Reddit rate-limits these extra loads.
   stored in the local state file with per-post exponential backoff (based on the poll interval, capped at 6 hours).
   Retries survive process restarts and continue even after a post drops out of the current Reddit listing.
 - Media: photo → `sendPhoto` (oversized/rejected → resized, still a photo; document only as last resort); GIF → `sendAnimation`;
-  MP4 / v.redd.it → `sendVideo`. Over 50 MB or undownloadable → a link message. Galleries, text posts and
-  other hosts are sent as links. Downloads only from `i.redd.it`, `preview.redd.it`, `v.redd.it`, `i.imgur.com` over https.
+  MP4 / v.redd.it → `sendVideo`. A failed or oversized media download remains unseen and enters the persistent retry queue; it is not silently marked done. Unsupported external URLs are sent as Reddit-link messages. Downloads only from `i.redd.it`, `preview.redd.it`, `v.redd.it`, `i.imgur.com` over https.
 - Reddit video: tries `DASH_1080…240` and `DASH_AUDIO_*` by HEAD probing (not parsing the MPD). Untested against live Reddit.
 - Reddit blocks/CAPTCHAs/login walls are reported and skipped with backoff. Old Reddit now requires a logged-in session.
   For the Lightpanda browser flow, set `REDDIT_SESSION_COOKIE` in the host's secret environment variables to the value
