@@ -72,6 +72,14 @@ pub fn next_penalty(prev: Duration) -> Duration {
     }
 }
 
+/// Keep failed posts eligible for retry, with per-post exponential backoff.
+fn delivery_retry_delay(interval: Duration, attempts: u8) -> Duration {
+    let shift = attempts.saturating_sub(1).min(5);
+    interval
+        .saturating_mul(1u32 << shift)
+        .min(Duration::from_secs(6 * 60 * 60))
+}
+
 fn fnv64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
@@ -423,7 +431,7 @@ pub struct Scheduler {
     deliverer: Deliverer,
     health: Arc<Health>,
     token: CancellationToken,
-    fail_counts: HashMap<String, u8>,
+    fail_counts: HashMap<String, (u8, Instant)>,
     cycles: u64,
     penalty: Duration,
     next_group: usize,
@@ -600,21 +608,61 @@ impl Scheduler {
         Ok(None)
     }
 
-    /// Loads the post's JSON in the browser (one extra page load) to learn the gallery's images.
-    async fn deliver_gallery_post(&mut self, chat: &str, p: &Post, id: &str) -> Result<()> {
+    /// Read gallery metadata from Reddit's JSON document. If the configured host
+    /// returns an HTML shell/error page, try the other canonical Reddit host.
+    async fn deliver_gallery_post(&mut self, chat: &str, p: &Post, id: &str, media_only: bool) -> Result<()> {
         sleep(self.cfg.request_gap).await;
-        let url = format!("{}/comments/{}.json?raw_json=1", self.cfg.reddit_base, id);
-        let items = match self.browser.fetch_text(&url).await {
-            Ok(t) if !t.trim_start().starts_with('[') && t.to_ascii_lowercase().contains("too many requests") => Err(anyhow::anyhow!("rate limited while loading gallery data")),
-            Ok(t) => parse_gallery(&t),
-            Err(e) => Err(e),
+
+        let primary_base = self.cfg.reddit_base.trim_end_matches('/');
+        let alternate_base = if primary_base.contains("old.reddit.com") {
+            "https://www.reddit.com"
+        } else {
+            "https://old.reddit.com"
         };
-        match items {
-            Ok(items) => self.deliverer.deliver_gallery(chat, p, &items).await,
-            Err(e) => {
-                warn!(post = %p.id, "gallery metadata could not be resolved; sending original Reddit post link: {e:#}");
-                self.deliverer.deliver_link(chat, p, "Gallery media could not be loaded; open the original post.").await
+        let urls = [
+            format!("{primary_base}/comments/{id}.json?raw_json=1"),
+            format!("{alternate_base}/comments/{id}.json?raw_json=1"),
+        ];
+
+        let mut last_error = None;
+        for (index, url) in urls.iter().enumerate() {
+            if index > 0 {
+                sleep(self.cfg.request_gap).await;
             }
+
+            let body = match self.browser.fetch_text(url).await {
+                Ok(body) => body,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
+            if body.to_ascii_lowercase().contains("too many requests") {
+                last_error = Some(anyhow::anyhow!("Reddit rate-limited the gallery metadata request"));
+                break;
+            }
+
+            match parse_gallery(&body) {
+                Ok(items) => return self.deliverer.deliver_gallery(chat, p, &items).await,
+                Err(e) => {
+                    let prefix = body.trim().chars().take(120).collect::<String>().replace('\n', " ");
+                    last_error = Some(anyhow::anyhow!("{e:#}; response prefix: {prefix:?}"));
+                }
+            }
+        }
+
+        let error = last_error.unwrap_or_else(|| anyhow::anyhow!("Reddit returned no gallery metadata"));
+        warn!(post = %p.id, media_only, reason = %error, "gallery media could not be resolved");
+
+        // A media-only feed must never turn a failed media extraction into a
+        // plain Reddit-link post. Returning Err leaves the ID unseen for retry.
+        if media_only {
+            Err(anyhow::anyhow!("gallery extraction failed; post remains unseen for retry: {error:#}"))
+        } else {
+            self.deliverer
+                .deliver_link(chat, p, "Gallery media could not be loaded; open the original post.")
+                .await
         }
     }
 
@@ -664,7 +712,7 @@ impl Scheduler {
         if fresh_count > 0 {
             info!(subs = %g.names.join("+"), new = fresh_count, "processing");
         }
-        let (mut sent, mut seeded, mut skipped) = (0u32, 0u32, 0u32);
+        let (mut sent, mut seeded, mut skipped, mut retry_deferred) = (0u32, 0u32, 0u32, 0u32);
         let (mut filtered_nsfw, mut filtered_media_only, mut filtered_spoiler, mut duplicate_media, mut failed) =
             (0u32, 0u32, 0u32, 0u32, 0u32);
 
@@ -710,9 +758,24 @@ impl Scheduler {
                     continue;
                 }
             }
+            let retry_key = format!("{chat}|{}", p.id);
+            if let Some((attempts, retry_at)) = self.fail_counts.get(&retry_key) {
+                let now = Instant::now();
+                if *retry_at > now {
+                    retry_deferred += 1;
+                    debug!(
+                        post = %p.id,
+                        previous_attempts = *attempts,
+                        retry_in_secs = (*retry_at - now).as_secs(),
+                        "delivery retry deferred"
+                    );
+                    continue;
+                }
+            }
+
             info!(sub = %sub, post = %p.id, "delivery started");
             let result = match &p.media {
-                Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id).await,
+                Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id, g.media_only).await,
                 _ => self.deliverer.deliver(chat, &p, g.media_only).await,
             };
             match result {
@@ -722,7 +785,7 @@ impl Scheduler {
                     if let Some(k) = mkey {
                         self.store.insert(&k);
                     }
-                    self.fail_counts.remove(&format!("{chat}|{}", p.id));
+                    self.fail_counts.remove(&retry_key);
                     sent += 1;
                 }
                 Err(e) => {
@@ -730,13 +793,22 @@ impl Scheduler {
                     if self.fail_counts.len() > 1000 {
                         self.fail_counts.clear();
                     }
-                    let n = self.fail_counts.entry(format!("{chat}|{}", p.id)).or_insert(0);
-                    *n += 1;
-                    warn!(sub = %sub, post = %p.id, attempt = *n, "delivery failed: {e:#}");
-                    if *n >= 3 {
-                        warn!(post = %p.id, "giving up on post after 3 failed cycles");
-                        self.mark_seen(chat, &p.id);
-                    }
+                    let (attempt, delay) = {
+                        let state = self.fail_counts
+                            .entry(retry_key.clone())
+                            .or_insert((0, Instant::now()));
+                        state.0 = state.0.saturating_add(1);
+                        let delay = delivery_retry_delay(self.cfg.interval, state.0);
+                        state.1 = Instant::now() + delay;
+                        (state.0, delay)
+                    };
+                    warn!(
+                        sub = %sub,
+                        post = %p.id,
+                        attempt,
+                        retry_in_secs = delay.as_secs(),
+                        "delivery failed; post remains unseen and will be retried"
+                    );
                 }
             }
         }
@@ -760,6 +832,7 @@ impl Scheduler {
             sent,
             failed,
             skipped,
+            retry_deferred,
             "group processing summary"
         );
     }
@@ -839,5 +912,14 @@ mod tests {
             p = next_penalty(p);
         }
         assert_eq!(p.as_secs(), 3600);
+    }
+
+    #[test]
+    fn failed_delivery_retry_uses_capped_exponential_backoff() {
+        let interval = Duration::from_secs(600);
+        assert_eq!(delivery_retry_delay(interval, 1).as_secs(), 600);
+        assert_eq!(delivery_retry_delay(interval, 2).as_secs(), 1200);
+        assert_eq!(delivery_retry_delay(interval, 3).as_secs(), 2400);
+        assert_eq!(delivery_retry_delay(interval, 99).as_secs(), 6 * 60 * 60);
     }
 }
