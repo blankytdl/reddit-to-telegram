@@ -173,11 +173,31 @@ fn gallery_video_url(raw: &str) -> Option<String> {
     .then_some(url)
 }
 
+fn find_gallery_post_data(v: &serde_json::Value) -> Option<&serde_json::Value> {
+    if v.get("gallery_data")
+        .and_then(|g| g.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .is_some()
+    {
+        return Some(v);
+    }
+
+    match v {
+        serde_json::Value::Array(items) => items.iter().find_map(find_gallery_post_data),
+        serde_json::Value::Object(fields) => fields.values().find_map(find_gallery_post_data),
+        _ => None,
+    }
+}
+
 pub fn parse_gallery(json: &str) -> Result<Vec<GalleryItem>> {
-    let v: serde_json::Value = serde_json::from_str(json.trim()).context("gallery data was not valid JSON")?;
-    let d = &v[0]["data"]["children"][0]["data"];
-    let items = d["gallery_data"]["items"].as_array().ok_or_else(|| anyhow!("post has no gallery data"))?;
-    let meta = &d["media_metadata"];
+    let input = json.trim().trim_start_matches('\u{feff}');
+    let v: serde_json::Value = serde_json::from_str(input).context("gallery response was not valid JSON")?;
+    // Reddit normally returns a two-element listing array. Search for the post
+    // object instead of assuming that exact wrapper; some frontends wrap it.
+    let d = find_gallery_post_data(&v).ok_or_else(|| anyhow!("Reddit JSON did not contain gallery_data.items"))?;
+    let items = d["gallery_data"]["items"].as_array().ok_or_else(|| anyhow!("post has no gallery items"))?;
+    let empty_meta = serde_json::Value::Null;
+    let meta = d.get("media_metadata").unwrap_or(&empty_meta);
     let mut out = Vec::new();
 
     for it in items {
@@ -191,7 +211,7 @@ pub fn parse_gallery(json: &str) -> Result<Vec<GalleryItem>> {
         }
 
         let media_type = m["e"].as_str().unwrap_or("");
-        let mime = m["m"].as_str().unwrap_or("");
+        let mime = m["m"].as_str().unwrap_or("").to_ascii_lowercase();
         let source = &m["s"];
         let source_u = source["u"].as_str();
         let source_mp4 = source["mp4"].as_str().and_then(gallery_video_url);
@@ -225,11 +245,26 @@ pub fn parse_gallery(json: &str) -> Result<Vec<GalleryItem>> {
             continue;
         }
 
-        let ext = match mime {
+        let ext = match mime.as_str() {
             "image/jpg" | "image/jpeg" => "jpg",
             "image/png" => "png",
             "image/webp" => "webp",
-            _ => continue,
+            _ => {
+                // Some Reddit responses omit the MIME type but still include a
+                // valid source URL. Infer only a known image extension.
+                let source_ext = source_u
+                    .and_then(|u| u.split(['?', '#']).next())
+                    .and_then(|u| u.rsplit('.').next())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                match source_ext.as_str() {
+                    "png" => "png",
+                    "webp" => "webp",
+                    "jpg" | "jpeg" => "jpg",
+                    _ if media_type == "Image" => "jpg",
+                    _ => continue,
+                }
+            }
         };
         let fallback = format!("https://i.redd.it/{id}.{ext}");
         let url = source_u.and_then(gallery_source_url).unwrap_or(fallback);
@@ -359,6 +394,9 @@ mod tests {
           }}}]}}]"#;
         let g = parse_gallery(j).unwrap();
         assert_eq!(g.len(), 5);
+        let root: serde_json::Value = serde_json::from_str(j).unwrap();
+        let wrapped = serde_json::json!({ "wrapped_response": root[0].clone() }).to_string();
+        assert_eq!(parse_gallery(&wrapped).unwrap(), g);
         assert_eq!(g[0], GalleryItem { url: "https://i.redd.it/aaa.jpg".into(), kind: GalleryKind::Photo });
         assert_eq!(g[1], GalleryItem { url: "https://i.redd.it/bbb.gif".into(), kind: GalleryKind::Animation });
         assert_eq!(g[2], GalleryItem { url: "https://i.redd.it/ddd.png".into(), kind: GalleryKind::Photo });
