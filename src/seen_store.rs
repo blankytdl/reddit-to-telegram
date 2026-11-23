@@ -3,19 +3,39 @@
 //! The state file lives on the host's persistent server filesystem. No remote
 //! database, GitHub token, API calls, or background sync process is required.
 use anyhow::{Context, Result};
+use crate::reddit_parser::Post;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     path::{Path, PathBuf},
     time::Duration,
 };
 use tracing::{info, warn};
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingDelivery {
+    pub chat: String,
+    pub post: Post,
+    #[serde(default)]
+    pub media_only: bool,
+    #[serde(default)]
+    pub attempts: u8,
+    #[serde(default)]
+    pub retry_at_unix: u64,
+    #[serde(default)]
+    pub gallery_index: usize,
+}
+
+fn pending_key(chat: &str, id: &str) -> String {
+    format!("{}|{id}", chat.to_ascii_lowercase())
+}
+
 #[derive(Serialize)]
 struct StateRef<'a> {
     ids: &'a VecDeque<String>,
     subs: Vec<&'a str>,
+    pending: Vec<&'a PendingDelivery>,
 }
 
 #[derive(Deserialize, Default)]
@@ -24,12 +44,15 @@ struct State {
     ids: Vec<String>,
     #[serde(default)]
     subs: Vec<String>,
+    #[serde(default)]
+    pending: Vec<PendingDelivery>,
 }
 
 pub struct SeenStore {
     order: VecDeque<String>,
     set: HashSet<String>,
     subs: HashSet<String>,
+    pending: HashMap<String, PendingDelivery>,
     dirty: bool,
     path: PathBuf,
     cap: usize,
@@ -42,6 +65,7 @@ impl SeenStore {
             order: VecDeque::new(),
             set: HashSet::new(),
             subs: HashSet::new(),
+            pending: HashMap::new(),
             dirty: false,
             path,
             cap,
@@ -93,6 +117,9 @@ impl SeenStore {
             self.insert_inner(id);
         }
         self.subs.extend(state.subs.into_iter().map(|s| s.to_ascii_lowercase()));
+        for pending in state.pending {
+            self.pending.insert(pending_key(&pending.chat, &pending.post.id), pending);
+        }
     }
 
     fn insert_inner(&mut self, id: String) -> bool {
@@ -125,10 +152,39 @@ impl SeenStore {
     }
 
     /// True if this subreddit was already running for this destination channel.
-    pub fn sub_known(&self, chat: &str, sub: &str) -> bool {
+    pub fn sub_known(&self, chat: &str, sub: &str, sort: &str) -> bool {
         let sub = sub.to_ascii_lowercase();
-        self.subs.contains(&format!("{chat}|{sub}").to_ascii_lowercase())
+        let chat = chat.to_ascii_lowercase();
+        // The unsuffixed marker is from older versions and remains compatible.
+        self.subs.contains(&format!("{chat}|{sub}|{}", sort.to_ascii_lowercase()))
+            || self.subs.contains(&format!("{chat}|{sub}"))
             || self.subs.contains(&format!("legacy|{sub}"))
+    }
+
+    pub fn has_pending(&self, chat: &str, id: &str) -> bool {
+        self.pending.contains_key(&pending_key(chat, id))
+    }
+
+    pub fn upsert_pending(&mut self, pending: PendingDelivery) {
+        self.pending.insert(pending_key(&pending.chat, &pending.post.id), pending);
+        self.dirty = true;
+    }
+
+    pub fn remove_pending(&mut self, chat: &str, id: &str) {
+        if self.pending.remove(&pending_key(chat, id)).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Return due retries oldest-first, bounded so a large backlog cannot monopolize a cycle.
+    pub fn pending_due(&self, now_unix: u64, limit: usize) -> Vec<PendingDelivery> {
+        let mut due: Vec<_> = self.pending.values()
+            .filter(|p| p.retry_at_unix <= now_unix)
+            .cloned()
+            .collect();
+        due.sort_by_key(|p| p.retry_at_unix);
+        due.truncate(limit);
+        due
     }
 
     pub fn mark_sub(&mut self, sub: &str) {
@@ -140,7 +196,12 @@ impl SeenStore {
     fn snapshot(&self) -> Result<Vec<u8>> {
         let mut subs: Vec<&str> = self.subs.iter().map(String::as_str).collect();
         subs.sort_unstable();
-        Ok(serde_json::to_vec(&StateRef { ids: &self.order, subs })?)
+        let mut pending: Vec<&PendingDelivery> = self.pending.values().collect();
+        pending.sort_by(|a, b| {
+            a.chat.to_ascii_lowercase().cmp(&b.chat.to_ascii_lowercase())
+                .then_with(|| a.post.id.cmp(&b.post.id))
+        });
+        Ok(serde_json::to_vec(&StateRef { ids: &self.order, subs, pending })?)
     }
 
     /// Persist changes locally. The temp-file + rename pattern avoids leaving a
@@ -208,11 +269,16 @@ mod tests {
     #[test]
     fn sub_known_is_case_insensitive_for_channel_and_sub() {
         let mut s = SeenStore::new(tmp("case"), 10);
-        assert!(!s.sub_known("@AnimeChannel", "Anime"));
-        s.mark_sub(&crate::scheduler::sub_key("@AnimeChannel", "Anime"));
-        assert!(s.sub_known("@AnimeChannel", "Anime"));
-        assert!(s.sub_known("@animechannel", "ANIME"));
-        assert!(!s.sub_known("@AnimeChannel", "manga"));
+        assert!(!s.sub_known("@AnimeChannel", "Anime", "new"));
+        s.mark_sub(&crate::scheduler::sub_key("@AnimeChannel", "Anime", crate::config::Sort::New));
+        assert!(s.sub_known("@AnimeChannel", "Anime", "new"));
+        assert!(s.sub_known("@animechannel", "ANIME", "NEW"));
+        assert!(!s.sub_known("@AnimeChannel", "manga", "new"));
+        assert!(!s.sub_known("@AnimeChannel", "Anime", "hot"));
+
+        // Old state files used an unsuffixed channel/sub marker.
+        s.mark_sub("@animechannel|anime");
+        assert!(s.sub_known("@AnimeChannel", "Anime", "hot"));
     }
 
     #[tokio::test]
@@ -234,10 +300,46 @@ mod tests {
         s.mark_sub("Foo");
         s.flush().await;
 
-        let mut s2 = SeenStore::open(p.clone(), 100).await.unwrap();
+        let s2 = SeenStore::open(p.clone(), 100).await.unwrap();
         assert!(s2.contains("t3_x"));
         assert!(s2.sub_initialized("foo"));
         assert!(!s2.contains("t3_y"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test]
+    async fn pending_delivery_survives_restart() {
+        let p = tmp("pending-roundtrip");
+        let _ = std::fs::remove_file(&p);
+        let post = Post {
+            id: "abc123".into(),
+            title: "A title".into(),
+            author: "user".into(),
+            permalink: "https://www.reddit.com/r/anime/comments/abc123/".into(),
+            source_url: "https://unknown.example/image.avif".into(),
+            media: crate::reddit_parser::Media::None,
+            subreddit: "anime".into(),
+            spoiler: false,
+            nsfw: false,
+        };
+        let mut s = SeenStore::new(p.clone(), 100);
+        s.upsert_pending(PendingDelivery {
+            chat: "@anime".into(),
+            post: post.clone(),
+            media_only: true,
+            attempts: 2,
+            retry_at_unix: 12345,
+            gallery_index: 3,
+        });
+        s.flush().await;
+
+        let s2 = SeenStore::open(p.clone(), 100).await.unwrap();
+        assert!(s2.has_pending("@anime", "abc123"));
+        let due = s2.pending_due(12345, 10);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].post.title, "A title");
+        assert_eq!(due[0].attempts, 2);
+        assert_eq!(due[0].gallery_index, 3);
         let _ = std::fs::remove_file(&p);
     }
 

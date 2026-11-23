@@ -4,7 +4,7 @@ use crate::{
     media_downloader as md,
     reddit_browser::Browser,
     reddit_parser::{parse_gallery, parse_page, GalleryItem, GalleryKind, Media, PageStatus, Post},
-    seen_store::SeenStore,
+    seen_store::{PendingDelivery, SeenStore},
     telegram::{FileKind, Telegram, TgError},
 };
 use anyhow::{bail, Result};
@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::{sleep, timeout, Instant};
 use tokio_util::sync::CancellationToken;
@@ -74,7 +74,7 @@ pub fn next_penalty(prev: Duration) -> Duration {
 
 /// Keep failed posts eligible for retry, with per-post exponential backoff.
 fn delivery_retry_delay(interval: Duration, attempts: u8) -> Duration {
-    let shift = attempts.saturating_sub(1).min(5);
+    let shift = attempts.saturating_sub(1).min(6);
     interval
         .saturating_mul(1u32 << shift)
         .min(Duration::from_secs(6 * 60 * 60))
@@ -94,9 +94,20 @@ pub fn media_key(chat: &str, media: &str) -> String {
     format!("m:{:016x}", fnv64(&format!("{chat}\n{media}")))
 }
 
-/// Per-channel + subreddit key used to remember that a sub has been "seeded".
-pub fn sub_key(chat: &str, sub: &str) -> String {
-    format!("{chat}|{sub}").to_ascii_lowercase()
+/// Per-channel + subreddit + sort key used to remember that a feed has been seeded.
+pub fn sub_key(chat: &str, sub: &str, sort: Sort) -> String {
+    format!("{chat}|{sub}|{}", sort.path()).to_ascii_lowercase()
+}
+
+fn delivery_order(mut posts: Vec<Post>, sort: Sort) -> Vec<Post> {
+    if sort == Sort::New {
+        posts.reverse();
+    }
+    posts
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 fn retry_as_document(e: &TgError, kind: FileKind) -> bool {
@@ -177,101 +188,94 @@ impl Deliverer {
         }
     }
 
-    async fn fetch_photo(&self, url: &str) -> Option<(md::TempFile, u64)> {
-        let tf = match md::download(&self.http, url, GALLERY_ITEM_MAX, &md::ext_of(url)).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(reason = %e, "gallery image skipped");
-                return None;
-            }
-        };
+    async fn fetch_photo(&self, url: &str) -> Result<(md::TempFile, u64)> {
+        let tf = md::download(&self.http, url, GALLERY_ITEM_MAX, &md::ext_of(url)).await?;
         let size = tf.size().await;
         if size <= self.cfg.max_photo_bytes {
-            return Some((tf, size));
+            return Ok((tf, size));
         }
-        match self.shrink(tf.path()).await {
-            Some(s) => {
-                let sz = s.size().await;
-                Some((s, sz))
-            }
-            None => {
-                warn!("gallery image too large and cannot be resized; skipped");
-                None
-            }
-        }
+        let resized = self.shrink(tf.path()).await
+            .ok_or_else(|| anyhow::anyhow!("gallery image too large and could not be resized"))?;
+        let resized_size = resized.size().await;
+        Ok((resized, resized_size))
     }
 
-    async fn send_album(&self, c: &Ctx<'_>, files: &[(md::TempFile, u64)], cap: &str) -> Result<()> {
+    /// Returns how many leading photos were confirmed sent, so a failed gallery
+    /// can resume without repeating already delivered photos.
+    async fn send_album(&self, c: &Ctx<'_>, files: &[(md::TempFile, u64)], cap: &str) -> (usize, Result<()>) {
         let one = |cap: &str| Ctx { chat: c.chat, p: c.p, cap: cap.to_string(), spoiler: c.spoiler, media_only: c.media_only };
         if files.len() == 1 {
-            return self.upload_photo(&one(cap), files[0].0.path(), files[0].1).await;
+            return match self.upload_photo(&one(cap), files[0].0.path(), files[0].1).await {
+                Ok(()) => (1, Ok(())),
+                Err(e) => (0, Err(e)),
+            };
         }
         let paths: Vec<&Path> = files.iter().map(|(t, _)| t.path()).collect();
         self.pace_n(c.chat, paths.len() as u32).await;
         match self.tg.send_media_group(c.chat, &paths, cap, c.spoiler).await {
-            Ok(()) => Ok(()),
+            Ok(()) => (files.len(), Ok(())),
             Err(e) if retry_as_document(&e, FileKind::Photo) => {
                 warn!("telegram rejected album ({}); sending images one by one", e.desc);
-                for (i, (t, s)) in files.iter().enumerate() {
-                    self.upload_photo(&one(if i == 0 { cap } else { "" }), t.path(), *s).await?;
+                for (i, (t, size)) in files.iter().enumerate() {
+                    if let Err(err) = self.upload_photo(&one(if i == 0 { cap } else { "" }), t.path(), *size).await {
+                        return (i, Err(err));
+                    }
                 }
-                Ok(())
+                (files.len(), Ok(()))
             }
-            Err(e) => Err(e.into()),
+            Err(e) => (0, Err(e.into())),
         }
     }
 
     /// Sends every item in a Reddit gallery in its original order:
     /// photos in albums, GIFs as animations, and Reddit videos as videos.
-    pub async fn deliver_gallery(&self, chat: &str, p: &Post, items: &[GalleryItem]) -> Result<()> {
+    /// Sends gallery items in order. On failure, the returned index points to the
+    /// first item not confirmed sent; the scheduler persists it for restart-safe resume.
+    pub async fn deliver_gallery(
+        &self,
+        chat: &str,
+        p: &Post,
+        items: &[GalleryItem],
+        start_index: usize,
+    ) -> (usize, Result<()>) {
         let spoiler = p.spoiler && self.cfg.spoiler_mode == SpoilerMode::Mark;
         let cap = caption(p, spoiler, self.cfg.caption);
         let c = Ctx { chat, p, cap: cap.clone(), spoiler, media_only: true };
-        let mut sent_any = false;
-        let mut cap_used = false;
-        let mut index = 0usize;
+        let mut index = start_index.min(items.len());
+        let mut cap_used = index > 0;
 
         while index < items.len() {
             if items[index].kind == GalleryKind::Photo {
-                // Keep photo albums ordered and capped at Telegram's 10-item album limit.
                 let start = index;
-                while index < items.len()
-                    && index - start < 10
-                    && items[index].kind == GalleryKind::Photo
-                {
-                    index += 1;
+                let mut end = start;
+                while end < items.len() && end - start < 10 && items[end].kind == GalleryKind::Photo {
+                    end += 1;
                 }
 
-                let mut files = Vec::with_capacity(index - start);
-                for it in &items[start..index] {
-                    if let Some(file) = self.fetch_photo(&it.url).await {
-                        files.push(file);
+                let mut files = Vec::with_capacity(end - start);
+                for item in &items[start..end] {
+                    match self.fetch_photo(&item.url).await {
+                        Ok(file) => files.push(file),
+                        Err(e) => return (start, Err(e)),
                     }
                 }
-                if files.is_empty() {
-                    continue;
-                }
+
                 let chunk_cap = if cap_used { "" } else { cap.as_str() };
-                match self.send_album(&c, &files, chunk_cap).await {
-                    Ok(()) => {
-                        sent_any = true;
-                        cap_used = true;
-                    }
-                    Err(e) if sent_any => {
-                        warn!(post = %p.id, "gallery photo album failed after earlier items were sent: {e:#}");
-                    }
-                    Err(e) => return Err(e),
+                let (sent, result) = self.send_album(&c, &files, chunk_cap).await;
+                if let Err(e) = result {
+                    return (start + sent, Err(e));
                 }
+                index = end;
+                cap_used = true;
                 continue;
             }
 
-            let item = &items[index];
-            index += 1;
-            let item_cap = if cap_used { String::new() } else { cap.clone() };
+            let item_index = index;
+            let item = &items[item_index];
             let item_ctx = Ctx {
                 chat,
                 p,
-                cap: item_cap,
+                cap: if cap_used { String::new() } else { cap.clone() },
                 spoiler,
                 media_only: true,
             };
@@ -281,23 +285,14 @@ impl Deliverer {
                 GalleryKind::DashVideo => self.gallery_video_manifest(&item_ctx, &item.url).await,
                 GalleryKind::Photo => unreachable!("photo items are sent in albums"),
             };
-            match result {
-                Ok(()) => {
-                    sent_any = true;
-                    cap_used = true;
-                }
-                Err(e) if sent_any => {
-                    warn!(post = %p.id, url = %item.url, "gallery media item failed after earlier items were sent: {e:#}");
-                }
-                Err(e) => return Err(e),
+            if let Err(e) = result {
+                return (item_index, Err(e));
             }
+            index += 1;
+            cap_used = true;
         }
 
-        if sent_any {
-            Ok(())
-        } else {
-            bail!("no gallery item could be delivered")
-        }
+        (index, Ok(()))
     }
 
     async fn gallery_video_manifest(&self, c: &Ctx<'_>, url: &str) -> Result<()> {
@@ -431,7 +426,6 @@ pub struct Scheduler {
     deliverer: Deliverer,
     health: Arc<Health>,
     token: CancellationToken,
-    fail_counts: HashMap<String, (u8, Instant)>,
     cycles: u64,
     penalty: Duration,
     next_group: usize,
@@ -439,7 +433,7 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(cfg: Arc<Config>, browser: Browser, store: SeenStore, deliverer: Deliverer, health: Arc<Health>, token: CancellationToken) -> Self {
-        Self { cfg, browser, store, deliverer, health, token, fail_counts: HashMap::new(), cycles: 0, penalty: Duration::ZERO, next_group: 0 }
+        Self { cfg, browser, store, deliverer, health, token, cycles: 0, penalty: Duration::ZERO, next_group: 0 }
     }
 
     pub async fn run(mut self) {
@@ -503,28 +497,32 @@ impl Scheduler {
     }
 
     async fn cycle(&mut self) -> Result<()> {
+        // Retry old failures first, but count that work against this cycle's time budget.
+        let started = Instant::now();
+        self.retry_pending().await;
         let cfg = self.cfg.clone();
         let n = cfg.groups.len();
         if n == 0 {
             return Ok(());
         }
-        let started = Instant::now();
-        let (mut limited, mut done, mut longest) = (false, 0usize, Duration::ZERO);
+        let start_group = self.next_group % n;
+        let (mut limited, mut done) = (false, 0usize);
         for k in 0..n {
             if self.token.is_cancelled() {
                 break;
             }
             // Time budget: stop starting page loads we can't finish; resume round-robin next cycle.
-            if k > 0 && started.elapsed() + longest > cfg.cycle_budget {
+            if k > 0 && started.elapsed() > cfg.cycle_budget {
                 warn!(done, total = n, "cycle time budget reached; remaining groups run next cycle (raise POLL_INTERVAL_SECS or reduce subs)");
                 break;
             }
-            let gi = (self.next_group + k) % n;
+            // Use a stable starting offset. next_group is updated as work completes;
+            // reading it here as well would advance twice and skip groups.
+            let gi = (start_group + k) % n;
             let g = &cfg.groups[gi];
             if k > 0 {
                 sleep(cfg.request_gap).await;
             }
-            let t0 = Instant::now();
             self.health.set_stage(&format!("fetching r/{}", g.names.join("+")), 0);
             match self.fetch_group(g).await {
                 Ok(Some(posts)) => {
@@ -545,7 +543,6 @@ impl Scheduler {
                     done += 1;
                 }
             }
-            longest = longest.max(t0.elapsed());
         }
         self.health.set_stage("flushing cycle state", 0);
         // Respect the configured sync interval. A forced flush is still done on shutdown.
@@ -555,28 +552,29 @@ impl Scheduler {
         Ok(())
     }
 
-    /// One multi-subreddit page load; falls back to per-sub loads if the combined page is empty.
+    /// Fetch each subreddit separately so a busy subreddit cannot consume another
+    /// subreddit's configured post limit.
     async fn fetch_group(&mut self, g: &Group) -> Result<Option<Vec<Post>>> {
-        let limit = g.total_limit();
-        let posts = match self.fetch_listing(&g.names, g.sort, limit).await? {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        if !posts.is_empty() || g.names.len() == 1 {
-            return Ok(Some(posts));
-        }
-        warn!(subs = %g.names.join("+"), "combined listing was empty; retrying each subreddit separately");
         let mut all = Vec::new();
-        for (name, lim) in g.names.iter().zip(&g.limits) {
+        for (index, (name, limit)) in g.names.iter().zip(&g.limits).enumerate() {
             if self.token.is_cancelled() {
-                break;
+                return Ok(None);
             }
-            sleep(self.cfg.request_gap).await;
-            match self.fetch_listing(std::slice::from_ref(name), g.sort, *lim).await {
-                Ok(Some(p)) => all.extend(p),
-                Ok(None) => return Ok(None),
-                Err(e) => warn!(sub = %name, "fetch failed: {e:#}"),
+            if index > 0 {
+                sleep(self.cfg.request_gap).await;
             }
+            let mut posts = match self.fetch_listing(std::slice::from_ref(name), g.sort, *limit).await? {
+                Some(posts) => posts,
+                None => return Ok(None),
+            };
+            // A single-subreddit request makes the source unambiguous even when
+            // Reddit omits the card's data-subreddit field.
+            for post in &mut posts {
+                if post.subreddit.is_empty() {
+                    post.subreddit = name.clone();
+                }
+            }
+            all.extend(posts);
         }
         Ok(Some(all))
     }
@@ -610,7 +608,14 @@ impl Scheduler {
 
     /// Read gallery metadata from Reddit's JSON document. If the configured host
     /// returns an HTML shell/error page, try the other canonical Reddit host.
-    async fn deliver_gallery_post(&mut self, chat: &str, p: &Post, id: &str, media_only: bool) -> Result<()> {
+    async fn deliver_gallery_post(
+        &mut self,
+        chat: &str,
+        p: &Post,
+        id: &str,
+        media_only: bool,
+        start_index: usize,
+    ) -> (usize, Result<()>) {
         sleep(self.cfg.request_gap).await;
 
         let primary_base = self.cfg.reddit_base.trim_end_matches('/');
@@ -644,7 +649,7 @@ impl Scheduler {
             }
 
             match parse_gallery(&body) {
-                Ok(items) => return self.deliverer.deliver_gallery(chat, p, &items).await,
+                Ok(items) => return self.deliverer.deliver_gallery(chat, p, &items, start_index).await,
                 Err(e) => {
                     let prefix = body.trim().chars().take(120).collect::<String>().replace('\n', " ");
                     last_error = Some(anyhow::anyhow!("{e:#}; response prefix: {prefix:?}"));
@@ -655,14 +660,12 @@ impl Scheduler {
         let error = last_error.unwrap_or_else(|| anyhow::anyhow!("Reddit returned no gallery metadata"));
         warn!(post = %p.id, media_only, reason = %error, "gallery media could not be resolved");
 
-        // A media-only feed must never turn a failed media extraction into a
-        // plain Reddit-link post. Returning Err leaves the ID unseen for retry.
         if media_only {
-            Err(anyhow::anyhow!("gallery extraction failed; post remains unseen for retry: {error:#}"))
+            (start_index, Err(anyhow::anyhow!("gallery extraction failed; post remains unseen for retry: {error:#}")))
         } else {
-            self.deliverer
+            (start_index, self.deliverer
                 .deliver_link(chat, p, "Gallery media could not be loaded; open the original post.")
-                .await
+                .await)
         }
     }
 
@@ -676,11 +679,74 @@ impl Scheduler {
         self.store.insert(&format!("{chat}|{id}"));
     }
 
+    async fn retry_pending(&mut self) {
+        const RETRY_BATCH: usize = 8;
+        let due = self.store.pending_due(unix_now(), RETRY_BATCH);
+        for mut item in due {
+            if self.token.is_cancelled() {
+                break;
+            }
+
+            let chat = item.chat.clone();
+            let id = item.post.id.clone();
+            if self.is_seen(&chat, &id) {
+                self.store.remove_pending(&chat, &id);
+                continue;
+            }
+
+            let mkey = if self.cfg.dedupe_media {
+                item.post.media.key().map(|media| media_key(&chat, media))
+            } else {
+                None
+            };
+            if mkey.as_ref().is_some_and(|key| self.store.contains(key)) {
+                self.mark_seen(&chat, &id);
+                self.store.remove_pending(&chat, &id);
+                self.store.flush().await;
+                continue;
+            }
+
+            self.health.set_stage(&format!("retrying post {id}"), 0);
+            let (gallery_index, result) = match &item.post.media {
+                Media::Gallery(gallery_id) => {
+                    self.deliver_gallery_post(&chat, &item.post, gallery_id, item.media_only, item.gallery_index).await
+                }
+                _ => (item.gallery_index, self.deliverer.deliver(&chat, &item.post, item.media_only).await),
+            };
+
+            match result {
+                Ok(()) => {
+                    self.mark_seen(&chat, &id);
+                    if let Some(key) = mkey {
+                        self.store.insert(&key);
+                    }
+                    self.store.remove_pending(&chat, &id);
+                    self.store.flush().await;
+                    info!(post = %id, "persisted retry delivered");
+                }
+                Err(error) => {
+                    item.attempts = item.attempts.saturating_add(1);
+                    let delay = delivery_retry_delay(self.cfg.interval, item.attempts);
+                    item.retry_at_unix = unix_now().saturating_add(delay.as_secs());
+                    item.gallery_index = gallery_index;
+                    self.store.upsert_pending(item.clone());
+                    self.store.flush().await;
+                    warn!(
+                        post = %id,
+                        attempt = item.attempts,
+                        retry_in_secs = delay.as_secs(),
+                        reason = %error,
+                        "persisted retry failed; keeping it queued"
+                    );
+                }
+            }
+        }
+    }
+
     async fn process_group(&mut self, g: &Group, posts: Vec<Post>) {
         self.health.set_stage(&format!("processing r/{}", g.names.join("+")), 0);
         let chat = g.chat_id.as_str();
         let fetched = posts.len();
-        let page_ok = fetched > 0;
         let mut per_sub = HashMap::<String, usize>::new();
         for p in &posts {
             let name = if p.subreddit.is_empty() { "(missing subreddit field)" } else { &p.subreddit };
@@ -692,9 +758,6 @@ impl Scheduler {
             .collect::<Vec<_>>()
             .join(",");
 
-        // Remove duplicate cards returned within the same Reddit page as well as IDs
-        // already delivered in earlier cycles. Count both cases so the logs explain
-        // why a configured subreddit may not produce a Telegram message.
         let mut batch_ids = HashSet::new();
         let (mut duplicate_in_batch, mut already_seen) = (0u32, 0u32);
         let mut fresh = Vec::with_capacity(fetched);
@@ -707,25 +770,52 @@ impl Scheduler {
                 fresh.push(p);
             }
         }
-        fresh.reverse(); // oldest first
+
+        // Reddit returns /new newest-first but /hot best-ranked-first.
+        // Reverse only /new so newly published posts are delivered chronologically.
+        fresh = delivery_order(fresh, g.sort);
         let fresh_count = fresh.len() as u32;
         if fresh_count > 0 {
-            info!(subs = %g.names.join("+"), new = fresh_count, "processing");
+            info!(subs = %g.names.join("+"), sort = g.sort.path(), new = fresh_count, "processing");
         }
+
         let (mut sent, mut seeded, mut skipped, mut retry_deferred) = (0u32, 0u32, 0u32, 0u32);
         let (mut filtered_nsfw, mut filtered_media_only, mut filtered_spoiler, mut duplicate_media, mut failed) =
             (0u32, 0u32, 0u32, 0u32, 0u32);
 
+        // Track first-run initialization separately for /new and /hot. Seed every
+        // post in each new stream before marking it initialized, including when the
+        // listing is empty. This prevents a restart mid-loop from losing posts.
+        let uninitialized: HashSet<String> = g.names.iter()
+            .filter(|name| !self.store.sub_known(chat, name, g.sort.path()))
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        if !self.cfg.send_backlog && !uninitialized.is_empty() {
+            let mut seeded_ids = HashSet::new();
+            for post in &fresh {
+                let sub = if post.subreddit.is_empty() { g.names[0].as_str() } else { post.subreddit.as_str() };
+                if uninitialized.contains(&sub.to_ascii_lowercase()) {
+                    self.mark_seen(chat, &post.id);
+                    seeded_ids.insert(post.id.clone());
+                    seeded += 1;
+                }
+            }
+            fresh.retain(|post| !seeded_ids.contains(&post.id));
+        }
+        for name in &g.names {
+            self.store.mark_sub(&sub_key(chat, name, g.sort));
+        }
+
         for p in fresh {
             if self.token.is_cancelled() {
-                return; // subs stay un-marked; nothing is lost, unsent posts are retried next run
+                return; // unprocessed posts remain unseen and will be picked up next cycle
             }
             let sub = if p.subreddit.is_empty() { g.names[0].as_str() } else { p.subreddit.as_str() };
             self.health.set_stage(&format!("post {} from r/{sub}", p.id), 0);
-            // First run for this sub+channel: remember what exists, don't flood the channel.
-            if !self.cfg.send_backlog && !self.store.sub_known(chat, sub) {
-                self.mark_seen(chat, &p.id);
-                seeded += 1;
+
+            // Queued items are retried once per cycle independently of the Reddit listing.
+            if self.store.has_pending(chat, &p.id) {
+                retry_deferred += 1;
                 continue;
             }
             if p.nsfw && !self.cfg.include_nsfw {
@@ -734,9 +824,10 @@ impl Scheduler {
                 skipped += 1;
                 continue;
             }
-            // When NSFW is enabled, keep flagged posts even if MEDIA_ONLY is on.
-            // Unsupported external media is still sent as its Reddit post link.
-            if g.media_only && p.media == Media::None && !(p.nsfw && self.cfg.include_nsfw) {
+            // Keep unsupported external links in media-only feeds; skip only actual
+            // text/self posts that have no external source URL at all.
+            if g.media_only && p.media == Media::None && p.source_url.is_empty()
+                && !(p.nsfw && self.cfg.include_nsfw) {
                 self.mark_seen(chat, &p.id);
                 filtered_media_only += 1;
                 skipped += 1;
@@ -758,25 +849,11 @@ impl Scheduler {
                     continue;
                 }
             }
-            let retry_key = format!("{chat}|{}", p.id);
-            if let Some((attempts, retry_at)) = self.fail_counts.get(&retry_key) {
-                let now = Instant::now();
-                if *retry_at > now {
-                    retry_deferred += 1;
-                    debug!(
-                        post = %p.id,
-                        previous_attempts = *attempts,
-                        retry_in_secs = (*retry_at - now).as_secs(),
-                        "delivery retry deferred"
-                    );
-                    continue;
-                }
-            }
 
             info!(sub = %sub, post = %p.id, "delivery started");
-            let result = match &p.media {
-                Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id, g.media_only).await,
-                _ => self.deliverer.deliver(chat, &p, g.media_only).await,
+            let (gallery_index, result) = match &p.media {
+                Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id, g.media_only, 0).await,
+                _ => (0, self.deliverer.deliver(chat, &p, g.media_only).await),
             };
             match result {
                 Ok(()) => {
@@ -785,40 +862,37 @@ impl Scheduler {
                     if let Some(k) = mkey {
                         self.store.insert(&k);
                     }
-                    self.fail_counts.remove(&retry_key);
+                    self.store.remove_pending(chat, &p.id);
                     sent += 1;
                 }
-                Err(e) => {
+                Err(error) => {
                     failed += 1;
-                    if self.fail_counts.len() > 1000 {
-                        self.fail_counts.clear();
-                    }
-                    let (attempt, delay) = {
-                        let state = self.fail_counts
-                            .entry(retry_key.clone())
-                            .or_insert((0, Instant::now()));
-                        state.0 = state.0.saturating_add(1);
-                        let delay = delivery_retry_delay(self.cfg.interval, state.0);
-                        state.1 = Instant::now() + delay;
-                        (state.0, delay)
-                    };
+                    let delay = delivery_retry_delay(self.cfg.interval, 1);
+                    self.store.upsert_pending(PendingDelivery {
+                        chat: chat.to_string(),
+                        post: p.clone(),
+                        media_only: g.media_only,
+                        attempts: 1,
+                        retry_at_unix: unix_now().saturating_add(delay.as_secs()),
+                        gallery_index,
+                    });
+                    // Persist failures immediately: a process restart must not erase
+                    // the retry queue or a gallery's resume position.
+                    self.store.flush().await;
                     warn!(
                         sub = %sub,
                         post = %p.id,
-                        attempt,
+                        attempt = 1,
                         retry_in_secs = delay.as_secs(),
-                        "delivery failed; post remains unseen and will be retried"
+                        reason = %error,
+                        "delivery failed; persisted retry queued"
                     );
                 }
             }
         }
-        if page_ok {
-            for name in &g.names {
-                self.store.mark_sub(&sub_key(chat, name));
-            }
-        }
         info!(
             subs = %g.names.join("+"),
+            sort = g.sort.path(),
             fetched,
             per_sub = %per_sub,
             fresh = fresh_count,
@@ -890,8 +964,17 @@ mod tests {
     fn media_key_is_stable_and_channel_scoped() {
         assert_eq!(media_key("@a", "https://i.redd.it/x.png"), media_key("@a", "https://i.redd.it/x.png"));
         assert_ne!(media_key("@a", "https://i.redd.it/x.png"), media_key("@b", "https://i.redd.it/x.png"));
-        assert_eq!(sub_key("@a", "Anime"), "@a|anime");
-        assert_eq!(sub_key("@AnimeChannel", "Anime"), "@animechannel|anime");
+        assert_eq!(sub_key("@a", "Anime", Sort::New), "@a|anime|new");
+        assert_eq!(sub_key("@AnimeChannel", "Anime", Sort::Hot), "@animechannel|anime|hot");
+    }
+
+    #[test]
+    fn new_posts_are_chronological_but_hot_keeps_rank_order() {
+        let posts = vec![post("top", false), post("next", false), post("last", false)];
+        let hot = delivery_order(posts.clone(), Sort::Hot);
+        assert_eq!(hot.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(), vec!["top", "next", "last"]);
+        let new = delivery_order(posts, Sort::New);
+        assert_eq!(new.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(), vec!["last", "next", "top"]);
     }
 
     #[test]
