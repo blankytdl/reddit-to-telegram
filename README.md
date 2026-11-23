@@ -75,7 +75,7 @@ become two albums); the title/caption sits on the first album. To learn the imag
 `/comments/<id>.json` document **in the same browser** (one extra page load per gallery post — still browser-based, but it is
 Reddit's unofficial JSON view, not an API client; it is a separate step you may want to know about). Image URLs are rebuilt as
 `i.redd.it/<media_id>.<ext>`. Oversized images are resized like normal photos; animated items are sent as separate animations
-after the album. If the gallery can't be resolved the bot sends a link (or retries, in media-only mode). If an album fails after
+after the album. If the configured Reddit host does not return gallery JSON, the bot retries the request against the other canonical Reddit host. In media-only mode, unresolved galleries never fall back to a plain link: the post stays unseen and is retried with per-post exponential backoff. Outside media-only mode, the original-post link remains the fallback. If an album fails after
 an earlier one was sent, the post is still marked done to avoid re-sending. Untested: whether Lightpanda renders that JSON view as
 readable text, and whether Reddit rate-limits these extra loads.
 
@@ -84,7 +84,7 @@ readable text, and whether Reddit rate-limits these extra loads.
   *not* sent (`SEND_BACKLOG_ON_FIRST_RUN=true` to change).
 - If the local state file is corrupt or cannot be read, the bot **exits** rather than silently resetting deduplication history.
   If the state file is missing, the first run seeds existing Reddit posts instead of sending the whole backlog.
-- Posts are marked seen only after successful delivery; a post failing 3 cycles in a row is skipped.
+- Posts are marked seen only after successful delivery or an intentional filter/first-run seed. Failed deliveries stay unseen and are retried with per-post exponential backoff (based on the poll interval, capped at 6 hours); restarting the process clears the in-memory retry delay but does not lose the unseen post.
 - Media: photo → `sendPhoto` (oversized/rejected → resized, still a photo; document only as last resort); GIF → `sendAnimation`;
   MP4 / v.redd.it → `sendVideo`. Over 50 MB or undownloadable → a link message. Galleries, text posts and
   other hosts are sent as links. Downloads only from `i.redd.it`, `preview.redd.it`, `v.redd.it`, `i.imgur.com` over https.
