@@ -269,11 +269,16 @@ mod tests {
     #[test]
     fn sub_known_is_case_insensitive_for_channel_and_sub() {
         let mut s = SeenStore::new(tmp("case"), 10);
-        assert!(!s.sub_known("@AnimeChannel", "Anime"));
-        s.mark_sub(&crate::scheduler::sub_key("@AnimeChannel", "Anime"));
-        assert!(s.sub_known("@AnimeChannel", "Anime"));
-        assert!(s.sub_known("@animechannel", "ANIME"));
-        assert!(!s.sub_known("@AnimeChannel", "manga"));
+        assert!(!s.sub_known("@AnimeChannel", "Anime", "new"));
+        s.mark_sub(&crate::scheduler::sub_key("@AnimeChannel", "Anime", crate::config::Sort::New));
+        assert!(s.sub_known("@AnimeChannel", "Anime", "new"));
+        assert!(s.sub_known("@animechannel", "ANIME", "NEW"));
+        assert!(!s.sub_known("@AnimeChannel", "manga", "new"));
+        assert!(!s.sub_known("@AnimeChannel", "Anime", "hot"));
+
+        // Old state files used an unsuffixed channel/sub marker.
+        s.mark_sub("@animechannel|anime");
+        assert!(s.sub_known("@AnimeChannel", "Anime", "hot"));
     }
 
     #[tokio::test]
