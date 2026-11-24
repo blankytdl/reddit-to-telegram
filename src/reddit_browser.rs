@@ -182,6 +182,17 @@ impl Browser {
     }
 
     async fn fetch_script(&mut self, url: &str, script: &'static str) -> Result<String> {
+        self.fetch_script_with_timeout(url, script, self.s.page_timeout).await
+    }
+
+    /// Fetches a page using a shorter caller-selected page deadline. The timeout
+    /// is enforced here, not by canceling this future externally, so a timeout
+    /// always closes the Lightpanda process and its in-flight CDP target.
+    pub async fn fetch_text_with_timeout(&mut self, url: &str, page_timeout: Duration) -> Result<String> {
+        self.fetch_script_with_timeout(url, TEXT_JS, page_timeout).await
+    }
+
+    async fn fetch_script_with_timeout(&mut self, url: &str, script: &'static str, pt: Duration) -> Result<String> {
         // `ensure()` includes spawning Lightpanda and completing the CDP WebSocket
         // handshake. Keep it inside its own deadline; the page timeout must not
         // leave startup/connection waits unbounded.
@@ -196,7 +207,6 @@ impl Browser {
                 bail!("Lightpanda startup/CDP connection timed out after 30s");
             }
         }
-        let pt = self.s.page_timeout;
         let session_cookie = self.s.reddit_session_cookie.clone();
         let cdp = self.cdp.as_mut().ok_or_else(|| anyhow!("no CDP connection"))?;
         let r = timeout(pt, fetch_inner(cdp, url, pt, script, session_cookie.as_deref())).await;
