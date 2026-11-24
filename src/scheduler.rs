@@ -3,7 +3,10 @@ use crate::{
     health::Health,
     media_downloader as md,
     reddit_browser::Browser,
-    reddit_parser::{parse_gallery, parse_page, GalleryItem, GalleryKind, Media, PageStatus, Post},
+    reddit_parser::{
+        parse_gallery, parse_gallery_dom, parse_page, GalleryItem, GalleryKind, Media, PageStatus,
+        Post,
+    },
     seen_store::{PendingDelivery, SeenStore},
     telegram::{FileKind, Telegram, TgError},
 };
@@ -11,7 +14,6 @@ use anyhow::{bail, Result};
 use reqwest::Client;
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
     path::Path,
     sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -120,22 +122,6 @@ fn retry_as_document(e: &TgError, kind: FileKind) -> bool {
 }
 
 // ---------- delivery ----------
-
-/// Marker for a specific, persistent Reddit response that cannot be retried usefully.
-#[derive(Debug)]
-struct GallerySecurityBlocked;
-
-impl fmt::Display for GallerySecurityBlocked {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("both canonical Reddit hosts explicitly blocked gallery metadata with a network-security page")
-    }
-}
-
-impl std::error::Error for GallerySecurityBlocked {}
-
-fn is_permanent_gallery_block(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<GallerySecurityBlocked>().is_some()
-}
 
 fn is_reddit_network_security_block(body: &str) -> bool {
     body.to_ascii_lowercase().contains("blocked by network security")
@@ -733,14 +719,34 @@ impl Scheduler {
             }
         }
 
-        if media_only && network_security_blocks == urls.len() {
-            warn!(
-                post = %p.id,
-                gallery_index = start_index,
-                partial_gallery = start_index > 0,
-                "both canonical Reddit hosts returned explicit network-security blocks; permanently skipping media-only gallery"
-            );
-            return (start_index, Err(GallerySecurityBlocked.into()));
+        // The JSON route can be denied while Reddit's ordinary HTML page remains
+        // available. In that case read the rendered carousel DOM instead of
+        // silently dropping the gallery or trying to disguise the blocked URL.
+        if network_security_blocks == urls.len() {
+            let html_urls = [
+                format!("https://www.reddit.com/gallery/{id}"),
+                format!("https://old.reddit.com/comments/{id}/"),
+            ];
+            for (index, url) in html_urls.iter().enumerate() {
+                if index > 0 {
+                    sleep(self.cfg.request_gap).await;
+                }
+                info!(post = %p.id, attempt = index + 1, "gallery HTML fallback started");
+                match self.browser.fetch_gallery_with_timeout(url, self.cfg.gallery_lookup_timeout).await {
+                    Ok(body) => match parse_gallery_dom(&body) {
+                        Ok(items) => {
+                            info!(post = %p.id, items = items.len(), "gallery HTML carousel extracted");
+                            return self.deliverer.deliver_gallery(chat, p, &items, start_index, progress).await;
+                        }
+                        Err(error) => {
+                            last_error = Some(anyhow::anyhow!("HTML gallery extraction failed: {error:#}"));
+                        }
+                    },
+                    Err(error) => {
+                        last_error = Some(anyhow::anyhow!("HTML gallery page failed: {error:#}"));
+                    }
+                }
+            }
         }
 
         let error = last_error.unwrap_or_else(|| anyhow::anyhow!("Reddit returned no gallery metadata"));
@@ -821,18 +827,6 @@ impl Scheduler {
                     self.store.remove_pending(&chat, &id);
                     self.store.flush().await;
                     info!(post = %id, "persisted retry delivered");
-                }
-                Err(error) if is_permanent_gallery_block(&error) => {
-                    self.mark_seen(&chat, &id);
-                    self.store.remove_pending(&chat, &id);
-                    self.store.flush().await;
-                    warn!(
-                        post = %id,
-                        gallery_index,
-                        partial_gallery = gallery_index > 0,
-                        reason = %error,
-                        "permanently skipped blocked gallery and removed it from the retry queue"
-                    );
                 }
                 Err(error) => {
                     item.attempts = item.attempts.saturating_add(1);
@@ -989,20 +983,6 @@ impl Scheduler {
                     self.store.remove_pending(chat, &p.id);
                     sent += 1;
                 }
-                Err(error) if is_permanent_gallery_block(&error) => {
-                    self.mark_seen(chat, &p.id);
-                    self.store.remove_pending(chat, &p.id);
-                    self.store.flush().await;
-                    skipped += 1;
-                    warn!(
-                        sub = %sub,
-                        post = %p.id,
-                        gallery_index,
-                        partial_gallery = gallery_index > 0,
-                        reason = %error,
-                        "permanently skipped blocked gallery; it will not be retried automatically"
-                    );
-                }
                 Err(error) => {
                     failed += 1;
                     let delay = delivery_retry_delay(self.cfg.interval, 1);
@@ -1149,14 +1129,6 @@ mod tests {
         assert!(!is_reddit_network_security_block(
             "gallery response was not valid JSON"
         ));
-    }
-
-    #[test]
-    fn permanent_gallery_block_marker_survives_anyhow_error() {
-        let permanent: anyhow::Error = GallerySecurityBlocked.into();
-        let transient = anyhow::anyhow!("gallery metadata request timed out");
-        assert!(is_permanent_gallery_block(&permanent));
-        assert!(!is_permanent_gallery_block(&transient));
     }
 
     #[test]

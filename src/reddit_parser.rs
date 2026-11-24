@@ -189,6 +189,38 @@ fn find_gallery_post_data(v: &serde_json::Value) -> Option<&serde_json::Value> {
     }
 }
 
+
+/// Parse media URLs extracted from Reddit's normal gallery HTML carousel DOM.
+/// This fallback deliberately consumes only Reddit-hosted image/video URLs.
+pub fn parse_gallery_dom(json: &str) -> Result<Vec<GalleryItem>> {
+    let value: serde_json::Value = serde_json::from_str(json).context("gallery DOM extraction was not valid JSON")?;
+    let items = value.get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("gallery DOM extraction did not contain an items array"))?;
+    let mut out = Vec::new();
+
+    for item in items {
+        let Some(raw_url) = item.get("url").and_then(serde_json::Value::as_str) else { continue };
+        let raw_kind = item.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+        let (url, kind) = match raw_kind {
+            "photo" => (gallery_source_url(raw_url), GalleryKind::Photo),
+            "animation" => (gallery_source_url(raw_url), GalleryKind::Animation),
+            "video" => (gallery_video_url(raw_url), GalleryKind::Video),
+            "dash_video" => (gallery_video_url(raw_url), GalleryKind::DashVideo),
+            _ => (None, GalleryKind::Photo),
+        };
+        let Some(url) = url else { continue };
+        if !out.iter().any(|existing: &GalleryItem| existing.url == url) {
+            out.push(GalleryItem { url, kind });
+        }
+    }
+
+    if out.is_empty() {
+        bail!("Reddit HTML page contained no usable gallery carousel media");
+    }
+    Ok(out)
+}
+
 pub fn parse_gallery(json: &str) -> Result<Vec<GalleryItem>> {
     let input = json.trim().trim_start_matches('\u{feff}');
     let v: serde_json::Value = serde_json::from_str(input).context("gallery response was not valid JSON")?;
@@ -414,6 +446,24 @@ mod tests {
         assert_eq!(parse_gallery(untrusted_source).unwrap()[0].url, "https://i.redd.it/source2.jpg");
         assert!(parse_gallery("[]").is_err());
         assert!(parse_gallery("<html>").is_err());
+    }
+
+    #[test]
+    fn parses_gallery_html_dom_items_and_rejects_untrusted_urls() {
+        let input = r#"{"items":[
+          {"url":"https://i.redd.it/a.jpg","kind":"photo"},
+          {"url":"https://preview.redd.it/b.gif?width=100","kind":"animation"},
+          {"url":"https://v.redd.it/abc/DASH_720.mp4","kind":"video"},
+          {"url":"https://evil.example/x.jpg","kind":"photo"},
+          {"url":"https://v.redd.it/abc/DASHPlaylist.mpd","kind":"dash_video"}
+        ]}"#;
+        let items = parse_gallery_dom(input).unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0], GalleryItem { url: "https://i.redd.it/a.jpg".into(), kind: GalleryKind::Photo });
+        assert_eq!(items[1], GalleryItem { url: "https://preview.redd.it/b.gif?width=100".into(), kind: GalleryKind::Animation });
+        assert_eq!(items[2], GalleryItem { url: "https://v.redd.it/abc/DASH_720.mp4".into(), kind: GalleryKind::Video });
+        assert_eq!(items[3], GalleryItem { url: "https://v.redd.it/abc/DASHPlaylist.mpd".into(), kind: GalleryKind::DashVideo });
+        assert!(parse_gallery_dom(r#"{"items":[]}"#).is_err());
     }
 
     #[test]
