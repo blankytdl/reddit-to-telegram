@@ -193,7 +193,8 @@ fn find_gallery_post_data(v: &serde_json::Value) -> Option<&serde_json::Value> {
 /// Parse media URLs extracted from Reddit's normal gallery HTML carousel DOM.
 /// This fallback deliberately consumes only Reddit-hosted image/video URLs.
 pub fn parse_gallery_dom(json: &str) -> Result<Vec<GalleryItem>> {
-    let value: serde_json::Value = serde_json::from_str(json).context("gallery DOM extraction was not valid JSON")?;
+    let value: serde_json::Value = serde_json::from_str(json)
+        .context("gallery DOM extraction was not valid JSON")?;
     let items = value.get("items")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow!("gallery DOM extraction did not contain an items array"))?;
@@ -216,7 +217,10 @@ pub fn parse_gallery_dom(json: &str) -> Result<Vec<GalleryItem>> {
     }
 
     if out.is_empty() {
-        bail!("Reddit HTML page contained no usable gallery carousel media");
+        let diagnostics = value.get("diagnostics")
+            .map(serde_json::Value::to_string)
+            .unwrap_or_else(|| "not provided".to_string());
+        bail!("Reddit HTML page contained no usable gallery media (diagnostics: {diagnostics})");
     }
     Ok(out)
 }
@@ -464,6 +468,14 @@ mod tests {
         assert_eq!(items[2], GalleryItem { url: "https://v.redd.it/abc/DASH_720.mp4".into(), kind: GalleryKind::Video });
         assert_eq!(items[3], GalleryItem { url: "https://v.redd.it/abc/DASHPlaylist.mpd".into(), kind: GalleryKind::DashVideo });
         assert!(parse_gallery_dom(r#"{"items":[]}"#).is_err());
+    }
+
+    #[test]
+    fn gallery_dom_empty_result_reports_loader_diagnostics() {
+        let error = parse_gallery_dom(
+            r#"{"items":[],"diagnostics":{"loaderFound":true,"carouselFound":false,"slideCount":0}}"#
+        ).unwrap_err();
+        assert!(error.to_string().contains("loaderFound"));
     }
 
     #[test]
