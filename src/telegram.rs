@@ -6,7 +6,7 @@ use reqwest::{
 };
 use serde_json::{json, Value};
 use std::{fmt, future::Future, path::Path, time::Duration};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout, Instant};
 use tokio_util::io::ReaderStream;
 use tracing::warn;
 
@@ -56,6 +56,7 @@ pub struct Telegram {
     client: Client,
     base: String,
     token: String,
+    operation_timeout: Duration,
 }
 
 fn mime_for(path: &Path) -> &'static str {
@@ -81,8 +82,8 @@ async fn file_part(path: &Path) -> Result<Part, TgError> {
 }
 
 impl Telegram {
-    pub fn new(client: Client, base: String, token: String) -> Self {
-        Self { client, base, token }
+    pub fn new(client: Client, base: String, token: String, operation_timeout: Duration) -> Self {
+        Self { client, base, token, operation_timeout }
     }
 
     fn url(&self, method: &str) -> String {
@@ -103,15 +104,24 @@ impl Telegram {
         })
     }
 
-    async fn retry<F, Fut>(&self, mut f: F) -> Result<(), TgError>
+    async fn retry<F, Fut>(&self, total_timeout: Duration, mut f: F) -> Result<(), TgError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<(), TgError>>,
     {
+        let deadline = Instant::now() + total_timeout;
         let mut attempt: u64 = 0;
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TgError { code: 0, desc: format!("Telegram operation exceeded its {}s deadline", total_timeout.as_secs()), retry_after: None });
+            }
             attempt += 1;
-            match f().await {
+            let result = match timeout(remaining, f()).await {
+                Ok(result) => result,
+                Err(_) => return Err(TgError { code: 0, desc: format!("Telegram operation exceeded its {}s deadline", total_timeout.as_secs()), retry_after: None }),
+            };
+            match result {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     let wait = if e.code == 429 {
@@ -122,8 +132,8 @@ impl Telegram {
                         None
                     };
                     match wait {
-                        Some(w) if attempt < 3 => {
-                            warn!(code = e.code, wait_secs = w, "telegram call failed; retrying");
+                        Some(w) if attempt < 3 && Duration::from_secs(w) < deadline.saturating_duration_since(Instant::now()) => {
+                            warn!(code = e.code, wait_secs = w, "telegram call failed; retrying within operation deadline");
                             sleep(Duration::from_secs(w)).await;
                         }
                         _ => return Err(e),
@@ -140,8 +150,8 @@ impl Telegram {
         });
         let (url, body) = (&url, &body);
         self.retry(move || async move {
-            Self::parse(self.client.post(url).json(body).timeout(Duration::from_secs(30)).send().await).await
-        })
+            Self::parse(self.client.post(url).json(body).timeout(self.operation_timeout.min(Duration::from_secs(30))).send().await).await
+        }, self.operation_timeout.min(Duration::from_secs(30)))
         .await
     }
 
@@ -158,13 +168,13 @@ impl Telegram {
             form = form.text("has_spoiler", "true");
         }
         form = form.part(kind.field(), part);
-        Self::parse(self.client.post(url).multipart(form).timeout(Duration::from_secs(600)).send().await).await
+        Self::parse(self.client.post(url).multipart(form).timeout(self.operation_timeout).send().await).await
     }
 
     pub async fn send_file(&self, chat: &str, kind: FileKind, path: &Path, caption: &str, spoiler: bool) -> Result<(), TgError> {
         let url = self.url(kind.method());
         let url = &url;
-        self.retry(move || self.upload_once(url, chat, kind, path, caption, spoiler)).await
+        self.retry(self.operation_timeout, move || self.upload_once(url, chat, kind, path, caption, spoiler)).await
     }
 
     async fn group_once(&self, url: &str, chat: &str, files: &[&Path], caption: &str, spoiler: bool) -> Result<(), TgError> {
@@ -184,13 +194,13 @@ impl Telegram {
             media.push(m);
         }
         form = form.text("media", Value::Array(media).to_string());
-        Self::parse(self.client.post(url).multipart(form).timeout(Duration::from_secs(900)).send().await).await
+        Self::parse(self.client.post(url).multipart(form).timeout(self.operation_timeout).send().await).await
     }
 
     /// Photo album (2..=10 photos). The caption is shown on the album via its first item.
     pub async fn send_media_group(&self, chat: &str, files: &[&Path], caption: &str, spoiler: bool) -> Result<(), TgError> {
         let url = self.url("sendMediaGroup");
         let url = &url;
-        self.retry(move || self.group_once(url, chat, files, caption, spoiler)).await
+        self.retry(self.operation_timeout, move || self.group_once(url, chat, files, caption, spoiler)).await
     }
 }
