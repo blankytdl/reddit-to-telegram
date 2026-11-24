@@ -188,9 +188,12 @@ impl Deliverer {
         }
     }
 
-    async fn fetch_photo(&self, url: &str) -> Result<(md::TempFile, u64)> {
+    async fn fetch_photo(&self, post_id: &str, url: &str) -> Result<(md::TempFile, u64)> {
+        let started = Instant::now();
+        info!(post = %post_id, "gallery photo download started");
         let tf = md::download(&self.http, url, GALLERY_ITEM_MAX, &md::ext_of(url), self.cfg.media_download_timeout).await?;
         let size = tf.size().await;
+        info!(post = %post_id, bytes = size, elapsed_ms = started.elapsed().as_millis(), "gallery photo download completed");
         if size <= self.cfg.max_photo_bytes {
             return Ok((tf, size));
         }
@@ -256,7 +259,7 @@ impl Deliverer {
 
                 let mut files = Vec::with_capacity(end - start);
                 for item in &items[start..end] {
-                    match self.fetch_photo(&item.url).await {
+                    match self.fetch_photo(&p.id, &item.url).await {
                         Ok(file) => files.push(file),
                         Err(e) => return (start, Err(e)),
                     }
@@ -393,10 +396,20 @@ impl Deliverer {
     }
 
     async fn media(&self, c: &Ctx<'_>, url: &str, kind: FileKind) -> Result<()> {
+        let download_started = Instant::now();
+        info!(post = %c.p.id, kind = ?kind, "media download started");
         match md::download(&self.http, url, self.cfg.max_upload_bytes, &md::ext_of(url), self.cfg.media_download_timeout).await {
             Ok(tf) => {
                 let size = tf.size().await;
-                self.upload(c, tf.path(), size, kind).await // tf dropped -> temp file removed
+                info!(post = %c.p.id, kind = ?kind, bytes = size, elapsed_ms = download_started.elapsed().as_millis(), "media download completed");
+                let upload_started = Instant::now();
+                info!(post = %c.p.id, kind = ?kind, "Telegram upload started");
+                let result = self.upload(c, tf.path(), size, kind).await;
+                match &result {
+                    Ok(()) => info!(post = %c.p.id, kind = ?kind, elapsed_ms = upload_started.elapsed().as_millis(), "Telegram upload completed"),
+                    Err(e) => warn!(post = %c.p.id, kind = ?kind, elapsed_ms = upload_started.elapsed().as_millis(), reason = %e, "Telegram upload failed"),
+                }
+                result // tf dropped -> temp file removed
             }
             Err(e) => {
                 // Never replace failed media with a Reddit link. Return the failure so the
@@ -669,6 +682,7 @@ impl Scheduler {
                 sleep(self.cfg.request_gap).await;
             }
 
+            info!(post = %p.id, attempt = index + 1, "gallery metadata lookup started");
             let body = match self.browser.fetch_text_with_timeout(url, self.cfg.gallery_lookup_timeout).await {
                 Ok(body) => body,
                 Err(e) => {
