@@ -55,6 +55,91 @@ pub const TEXT_JS: &str = r#"(() => {
   return String(fromPre || body || root || '').trim();
 })()"#;
 
+/// Extract all media from Reddit's normal HTML gallery page. This is a DOM
+/// fallback for networks where Reddit's comments .json document is unavailable.
+pub const GALLERY_JS: &str = r#"(() => {
+  const postCandidates = Array.from(document.querySelectorAll('shreddit-post[post-type="gallery"], shreddit-post'));
+  const post = postCandidates.find(el => el.querySelector('gallery-carousel, shreddit-gallery-carousel'));
+  const carousel = (post && post.querySelector('gallery-carousel, shreddit-gallery-carousel'))
+    || document.querySelector('gallery-carousel, shreddit-gallery-carousel');
+  if (!carousel) return JSON.stringify({ items: [] });
+
+  const allowedImage = u => /^https:\/\/(?:i|preview|external-preview)\.redd\.it\//i.test(u);
+  const allowedVideo = u => /^https:\/\/v\.redd\.it\//i.test(u);
+  const cleanImage = raw => {
+    if (!raw) return '';
+    let u = String(raw).replace(/&amp;/g, '&');
+    u = u.replace(/^https:\/\/(?:preview|external-preview)\.redd\.it\//i, 'https://i.redd.it/');
+    u = u.split('#')[0].split('?')[0];
+    const slug = u.match(/\/([^/]+)-v0-([a-z0-9]+\.(?:jpe?g|png|gif|webp))$/i);
+    if (slug) u = u.replace(slug[1] + '-v0-', '');
+    return u;
+  };
+  const out = [];
+  const seen = new Set();
+  const add = (url, kind) => {
+    if (!url) return;
+    const clean = String(url).replace(/&amp;/g, '&');
+    const ok = kind === 'photo' || kind === 'animation'
+      ? allowedImage(clean)
+      : allowedVideo(clean);
+    if (!ok || seen.has(clean)) return;
+    seen.add(clean);
+    out.push({ url: clean, kind });
+  };
+
+  const slides = Array.from(carousel.querySelectorAll('li'));
+  for (const li of slides) {
+    const player = li.querySelector('shreddit-player');
+    if (player) {
+      let videoUrl = '';
+      const packaged = player.getAttribute('packaged-media-json');
+      if (packaged) {
+        try {
+          const permutations = JSON.parse(packaged).playbackMp4s?.permutations || [];
+          permutations.sort((a, b) =>
+            ((b.source && b.source.dimensions && b.source.dimensions.height) || 0) -
+            ((a.source && a.source.dimensions && a.source.dimensions.height) || 0));
+          for (const candidate of permutations) {
+            const candidateUrl = candidate && candidate.source && candidate.source.url;
+            if (candidateUrl && allowedVideo(candidateUrl)) {
+              videoUrl = candidateUrl;
+              break;
+            }
+          }
+        } catch (_) {}
+      }
+      if (!videoUrl) {
+        const video = li.querySelector('video source[src], video[src]');
+        const candidate = (video && (video.getAttribute('src') || video.src))
+          || player.getAttribute('src') || '';
+        if (allowedVideo(candidate)) videoUrl = candidate;
+      }
+      if (videoUrl) add(videoUrl, /\.mpd(?:\?|$)/i.test(videoUrl) ? 'dash_video' : 'video');
+      continue;
+    }
+
+    const video = li.querySelector('video source[src], video[src]');
+    const videoUrl = video && (video.getAttribute('src') || video.src);
+    if (videoUrl && allowedVideo(videoUrl)) {
+      add(videoUrl, /\.mpd(?:\?|$)/i.test(videoUrl) ? 'dash_video' : 'video');
+      continue;
+    }
+
+    const img = li.querySelector('img.media-lightbox-img') || li.querySelector('img');
+    if (!img) continue;
+    const raw = img.getAttribute('data-lazy-src')
+      || img.getAttribute('src')
+      || img.currentSrc
+      || '';
+    const url = cleanImage(raw);
+    if (!allowedImage(url)) continue;
+    add(url, /\.gif$/i.test(url) ? 'animation' : 'photo');
+  }
+
+  return JSON.stringify({ items: out });
+})()"#;
+
 struct Cdp {
     ws: Ws,
     next_id: u64,
@@ -191,6 +276,11 @@ impl Browser {
     /// always closes the Lightpanda process and its in-flight CDP target.
     pub async fn fetch_text_with_timeout(&mut self, url: &str, page_timeout: Duration) -> Result<String> {
         self.fetch_script_with_timeout(url, TEXT_JS, page_timeout).await
+    }
+
+    /// Reads gallery media from the normal HTML page DOM when the JSON route is blocked.
+    pub async fn fetch_gallery_with_timeout(&mut self, url: &str, page_timeout: Duration) -> Result<String> {
+        self.fetch_script_with_timeout(url, GALLERY_JS, page_timeout).await
     }
 
     async fn fetch_script_with_timeout(&mut self, url: &str, script: &'static str, pt: Duration) -> Result<String> {
