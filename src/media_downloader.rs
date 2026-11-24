@@ -60,10 +60,10 @@ pub fn ext_of(url: &str) -> String {
 }
 
 /// Streams `url` into a temp file; aborts as soon as `max` bytes are exceeded.
-pub async fn download(client: &Client, url: &str, max: u64, ext: &str) -> Result<TempFile> {
+pub async fn download(client: &Client, url: &str, max: u64, ext: &str, request_timeout: Duration) -> Result<TempFile> {
     let resp = client
         .get(url)
-        .timeout(Duration::from_secs(300))
+        .timeout(request_timeout)
         .send()
         .await
         .map_err(|e| anyhow!(e.without_url()))?;
@@ -92,8 +92,8 @@ pub async fn download(client: &Client, url: &str, max: u64, ext: &str) -> Result
 }
 
 /// Returns Some(content_length) if the URL answers a HEAD with success.
-async fn probe(client: &Client, url: &str) -> Option<Option<u64>> {
-    let r = client.head(url).timeout(Duration::from_secs(20)).send().await.ok()?;
+async fn probe(client: &Client, url: &str, request_timeout: Duration) -> Option<Option<u64>> {
+    let r = client.head(url).timeout(request_timeout.min(Duration::from_secs(10))).send().await.ok()?;
     if r.status().is_success() {
         Some(r.content_length())
     } else {
@@ -103,7 +103,7 @@ async fn probe(client: &Client, url: &str) -> Option<Option<u64>> {
 
 /// Picks the best DASH rendition that fits, downloads video (+audio) and
 /// remuxes with `ffmpeg -c copy` (no re-encoding). Returns the final mp4.
-pub async fn fetch_reddit_video(client: &Client, ffmpeg: &str, id: &str, max_total: u64) -> Result<TempFile> {
+pub async fn fetch_reddit_video(client: &Client, ffmpeg: &str, id: &str, max_total: u64, request_timeout: Duration) -> Result<TempFile> {
     let base = format!("https://v.redd.it/{id}");
     let audio_reserve: u64 = 6 * 1024 * 1024;
     let mut chosen: Option<String> = None;
@@ -120,7 +120,7 @@ pub async fn fetch_reddit_video(client: &Client, ffmpeg: &str, id: &str, max_tot
         "CMAF_220", "DASH_220",
     ] {
         let u = format!("{base}/{q}.mp4");
-        if let Some(len) = probe(client, &u).await {
+        if let Some(len) = probe(client, &u, request_timeout).await {
             if len.map_or(true, |l| l.saturating_add(audio_reserve) <= max_total) {
                 chosen = Some(u);
                 break;
@@ -133,15 +133,15 @@ pub async fn fetch_reddit_video(client: &Client, ffmpeg: &str, id: &str, max_tot
     // CMAF audio names are used by newer Reddit transcodes; retain legacy DASH names.
     for a in ["CMAF_AUDIO_128", "DASH_AUDIO_128", "CMAF_AUDIO_64", "DASH_AUDIO_64", "DASH_audio", "audio"] {
         let u = format!("{base}/{a}.mp4");
-        if probe(client, &u).await.is_some() {
+        if probe(client, &u, request_timeout).await.is_some() {
             audio_url = Some(u);
             break;
         }
     }
 
-    let video = download(client, &video_url, max_total, "mp4").await?;
+    let video = download(client, &video_url, max_total, "mp4", request_timeout).await?;
     let Some(audio_url) = audio_url else { return Ok(video) }; // silent clip
-    let audio = match download(client, &audio_url, 20 * 1024 * 1024, "mp4").await {
+    let audio = match download(client, &audio_url, 20 * 1024 * 1024, "mp4", request_timeout).await {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!("audio download failed ({e}); sending video without audio");
