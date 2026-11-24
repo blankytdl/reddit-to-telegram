@@ -12,7 +12,7 @@ use reqwest::Client;
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::{sleep, timeout, Instant};
@@ -188,9 +188,12 @@ impl Deliverer {
         }
     }
 
-    async fn fetch_photo(&self, url: &str) -> Result<(md::TempFile, u64)> {
-        let tf = md::download(&self.http, url, GALLERY_ITEM_MAX, &md::ext_of(url)).await?;
+    async fn fetch_photo(&self, post_id: &str, url: &str) -> Result<(md::TempFile, u64)> {
+        let started = Instant::now();
+        info!(post = %post_id, "gallery photo download started");
+        let tf = md::download(&self.http, url, GALLERY_ITEM_MAX, &md::ext_of(url), self.cfg.media_download_timeout).await?;
         let size = tf.size().await;
+        info!(post = %post_id, bytes = size, elapsed_ms = started.elapsed().as_millis(), "gallery photo download completed");
         if size <= self.cfg.max_photo_bytes {
             return Ok((tf, size));
         }
@@ -237,11 +240,13 @@ impl Deliverer {
         p: &Post,
         items: &[GalleryItem],
         start_index: usize,
+        progress: &AtomicUsize,
     ) -> (usize, Result<()>) {
         let spoiler = p.spoiler && self.cfg.spoiler_mode == SpoilerMode::Mark;
         let cap = caption(p, spoiler, self.cfg.caption);
         let c = Ctx { chat, p, cap: cap.clone(), spoiler, media_only: true };
         let mut index = start_index.min(items.len());
+        progress.store(index, Ordering::Relaxed);
         let mut cap_used = index > 0;
 
         while index < items.len() {
@@ -254,7 +259,7 @@ impl Deliverer {
 
                 let mut files = Vec::with_capacity(end - start);
                 for item in &items[start..end] {
-                    match self.fetch_photo(&item.url).await {
+                    match self.fetch_photo(&p.id, &item.url).await {
                         Ok(file) => files.push(file),
                         Err(e) => return (start, Err(e)),
                     }
@@ -263,9 +268,12 @@ impl Deliverer {
                 let chunk_cap = if cap_used { "" } else { cap.as_str() };
                 let (sent, result) = self.send_album(&c, &files, chunk_cap).await;
                 if let Err(e) = result {
-                    return (start + sent, Err(e));
+                    index = start + sent;
+                    progress.store(index, Ordering::Relaxed);
+                    return (index, Err(e));
                 }
                 index = end;
+                progress.store(index, Ordering::Relaxed);
                 cap_used = true;
                 continue;
             }
@@ -289,6 +297,7 @@ impl Deliverer {
                 return (item_index, Err(e));
             }
             index += 1;
+            progress.store(index, Ordering::Relaxed);
             cap_used = true;
         }
 
@@ -296,7 +305,9 @@ impl Deliverer {
     }
 
     async fn gallery_video_manifest(&self, c: &Ctx<'_>, url: &str) -> Result<()> {
-        let file = md::fetch_video_manifest(&self.cfg.ffmpeg_bin, url, self.cfg.max_upload_bytes).await?;
+        let file = timeout(self.cfg.media_download_timeout, md::fetch_video_manifest(&self.cfg.ffmpeg_bin, url, self.cfg.max_upload_bytes))
+            .await
+            .map_err(|_| anyhow::anyhow!("gallery video download/remux exceeded {}s", self.cfg.media_download_timeout.as_secs()))??;
         let size = file.size().await;
         self.upload(c, file.path(), size, FileKind::Video).await
     }
@@ -385,10 +396,20 @@ impl Deliverer {
     }
 
     async fn media(&self, c: &Ctx<'_>, url: &str, kind: FileKind) -> Result<()> {
-        match md::download(&self.http, url, self.cfg.max_upload_bytes, &md::ext_of(url)).await {
+        let download_started = Instant::now();
+        info!(post = %c.p.id, kind = ?kind, "media download started");
+        match md::download(&self.http, url, self.cfg.max_upload_bytes, &md::ext_of(url), self.cfg.media_download_timeout).await {
             Ok(tf) => {
                 let size = tf.size().await;
-                self.upload(c, tf.path(), size, kind).await // tf dropped -> temp file removed
+                info!(post = %c.p.id, kind = ?kind, bytes = size, elapsed_ms = download_started.elapsed().as_millis(), "media download completed");
+                let upload_started = Instant::now();
+                info!(post = %c.p.id, kind = ?kind, "Telegram upload started");
+                let result = self.upload(c, tf.path(), size, kind).await;
+                match &result {
+                    Ok(()) => info!(post = %c.p.id, kind = ?kind, elapsed_ms = upload_started.elapsed().as_millis(), "Telegram upload completed"),
+                    Err(e) => warn!(post = %c.p.id, kind = ?kind, elapsed_ms = upload_started.elapsed().as_millis(), reason = %e, "Telegram upload failed"),
+                }
+                result // tf dropped -> temp file removed
             }
             Err(e) => {
                 // Never replace failed media with a Reddit link. Return the failure so the
@@ -400,18 +421,22 @@ impl Deliverer {
     }
 
     async fn reddit_video(&self, c: &Ctx<'_>, id: &str) -> Result<()> {
-        match md::fetch_reddit_video(&self.http, &self.cfg.ffmpeg_bin, id, self.cfg.max_upload_bytes).await {
-            Ok(tf) => {
+        let fetch = timeout(self.cfg.media_download_timeout, md::fetch_reddit_video(
+            &self.http, &self.cfg.ffmpeg_bin, id, self.cfg.max_upload_bytes, self.cfg.media_download_timeout,
+        )).await;
+        match fetch {
+            Err(_) => Err(anyhow::anyhow!("Reddit video probes/download exceeded {}s", self.cfg.media_download_timeout.as_secs())),
+            Ok(Err(e)) => {
+                warn!(post = %c.p.id, reason = %e, "reddit video could not be fetched");
+                Err(e)
+            }
+            Ok(Ok(tf)) => {
                 let size = tf.size().await;
                 if size > self.cfg.max_upload_bytes {
-                    warn!(post = %c.p.id, size, "video exceeds upload limit; skipping media");
+                    warn!(post = %c.p.id, size, "video exceeds Telegram upload limit; skipping media");
                     bail!("video exceeds Telegram upload limit");
                 }
                 self.upload(c, tf.path(), size, FileKind::Video).await
-            }
-            Err(e) => {
-                warn!(post = %c.p.id, reason = %e, "reddit video could not be fetched");
-                Err(e)
             }
         }
     }
@@ -446,7 +471,7 @@ impl Scheduler {
             // On SIGTERM give the cycle 20 s to wrap up (Render kills after ~30 s), then
             // abandon it so the final state flush still happens.
             let tok = self.token.clone();
-            let hard = self.cfg.cycle_budget + Duration::from_secs(600);
+            let hard = self.cfg.cycle_budget + self.cfg.post_delivery_timeout + Duration::from_secs(30);
             let outcome = tokio::select! {
                 r = timeout(hard, self.cycle()) => Some(r),
                 _ = async { tok.cancelled().await; sleep(Duration::from_secs(20)).await; } => None,
@@ -497,9 +522,7 @@ impl Scheduler {
     }
 
     async fn cycle(&mut self) -> Result<()> {
-        // Retry old failures first, but count that work against this cycle's time budget.
         let started = Instant::now();
-        self.retry_pending().await;
         let cfg = self.cfg.clone();
         let n = cfg.groups.len();
         if n == 0 {
@@ -511,41 +534,64 @@ impl Scheduler {
             if self.token.is_cancelled() {
                 break;
             }
-            // Time budget: stop starting page loads we can't finish; resume round-robin next cycle.
-            if k > 0 && started.elapsed() > cfg.cycle_budget {
-                warn!(done, total = n, "cycle time budget reached; remaining groups run next cycle (raise POLL_INTERVAL_SECS or reduce subs)");
+            // Count request gaps and page loads against the same cycle budget.
+            let remaining = cfg.cycle_budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                warn!(done, total = n, "cycle budget reached; remaining groups run next poll");
                 break;
             }
-            // Use a stable starting offset. next_group is updated as work completes;
-            // reading it here as well would advance twice and skip groups.
             let gi = (start_group + k) % n;
             let g = &cfg.groups[gi];
             if k > 0 {
-                sleep(cfg.request_gap).await;
+                sleep(cfg.request_gap.min(remaining)).await;
+            }
+            let remaining = cfg.cycle_budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                warn!(done, total = n, "cycle budget reached before next subreddit fetch");
+                break;
             }
             self.health.set_stage(&format!("fetching r/{}", g.names.join("+")), 0);
-            match self.fetch_group(g).await {
-                Ok(Some(posts)) => {
-                    self.process_group(g, posts).await;
+            // A grouped fetch may contain several page loads. Bound the entire
+            // group by the remaining budget; a timed-out CDP target is discarded.
+            match timeout(remaining, self.fetch_group(g)).await {
+                Ok(Ok(Some(posts))) => {
+                    self.process_group(g, posts, started).await;
                     self.health.set_stage("checking state sync", 0);
                     self.store.flush_if_due(cfg.flush_min).await;
                     self.next_group = (gi + 1) % n;
                     done += 1;
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     limited = true;
-                    self.next_group = gi; // retry this group first next cycle
+                    self.next_group = gi;
                     break;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(subs = %g.names.join("+"), "fetch failed: {e:#}");
                     self.next_group = (gi + 1) % n;
                     done += 1;
                 }
+                Err(_) => {
+                    warn!(subs = %g.names.join("+"), "group fetch exceeded remaining cycle budget; restarting browser");
+                    self.browser.shutdown().await;
+                    self.next_group = gi;
+                    break;
+                }
+            }
+            if started.elapsed() >= cfg.cycle_budget {
+                break;
             }
         }
+
+        // Fresh feeds always have priority. Retry at most one old failure only
+        // after subreddit polling, and only when there is remaining cycle budget.
+        if !self.token.is_cancelled() && started.elapsed() < cfg.cycle_budget {
+            self.retry_pending().await;
+        } else if !self.store.pending_due(unix_now(), 1).is_empty() {
+            info!("pending delivery retry deferred to a later poll to protect fresh-feed polling");
+        }
+
         self.health.set_stage("flushing cycle state", 0);
-        // Respect the configured sync interval. A forced flush is still done on shutdown.
         self.store.flush_if_due(cfg.flush_min).await;
         self.penalty = if limited { next_penalty(self.penalty) } else { Duration::ZERO };
         info!(done, total = n, secs = started.elapsed().as_secs(), "cycle summary");
@@ -615,6 +661,7 @@ impl Scheduler {
         id: &str,
         media_only: bool,
         start_index: usize,
+        progress: &AtomicUsize,
     ) -> (usize, Result<()>) {
         sleep(self.cfg.request_gap).await;
 
@@ -635,7 +682,8 @@ impl Scheduler {
                 sleep(self.cfg.request_gap).await;
             }
 
-            let body = match self.browser.fetch_text(url).await {
+            info!(post = %p.id, attempt = index + 1, "gallery metadata lookup started");
+            let body = match self.browser.fetch_text_with_timeout(url, self.cfg.gallery_lookup_timeout).await {
                 Ok(body) => body,
                 Err(e) => {
                     last_error = Some(e);
@@ -649,7 +697,7 @@ impl Scheduler {
             }
 
             match parse_gallery(&body) {
-                Ok(items) => return self.deliverer.deliver_gallery(chat, p, &items, start_index).await,
+                Ok(items) => return self.deliverer.deliver_gallery(chat, p, &items, start_index, progress).await,
                 Err(e) => {
                     let prefix = body.trim().chars().take(120).collect::<String>().replace('\n', " ");
                     last_error = Some(anyhow::anyhow!("{e:#}; response prefix: {prefix:?}"));
@@ -680,7 +728,9 @@ impl Scheduler {
     }
 
     async fn retry_pending(&mut self) {
-        const RETRY_BATCH: usize = 8;
+        // Retry one old failure after fresh feeds have been checked, so a large
+        // retry queue cannot starve new subreddit polling.
+        const RETRY_BATCH: usize = 1;
         let due = self.store.pending_due(unix_now(), RETRY_BATCH);
         for mut item in due {
             if self.token.is_cancelled() {
@@ -707,11 +757,21 @@ impl Scheduler {
             }
 
             self.health.set_stage(&format!("retrying post {id}"), 0);
-            let (gallery_index, result) = match &item.post.media {
-                Media::Gallery(gallery_id) => {
-                    self.deliver_gallery_post(&chat, &item.post, gallery_id, item.media_only, item.gallery_index).await
+            let progress = AtomicUsize::new(item.gallery_index);
+            let outcome = timeout(self.cfg.post_delivery_timeout, async {
+                match &item.post.media {
+                    Media::Gallery(gallery_id) => {
+                        self.deliver_gallery_post(&chat, &item.post, gallery_id, item.media_only, item.gallery_index, &progress).await
+                    }
+                    _ => (item.gallery_index, self.deliverer.deliver(&chat, &item.post, item.media_only).await),
                 }
-                _ => (item.gallery_index, self.deliverer.deliver(&chat, &item.post, item.media_only).await),
+            }).await;
+            let (gallery_index, result) = match outcome {
+                Ok(result) => result,
+                Err(_) => (
+                    progress.load(Ordering::Relaxed),
+                    Err(anyhow::anyhow!("post delivery timed out after {}s", self.cfg.post_delivery_timeout.as_secs())),
+                ),
             };
 
             match result {
@@ -743,7 +803,7 @@ impl Scheduler {
         }
     }
 
-    async fn process_group(&mut self, g: &Group, posts: Vec<Post>) {
+    async fn process_group(&mut self, g: &Group, posts: Vec<Post>, cycle_started: Instant) {
         self.health.set_stage(&format!("processing r/{}", g.names.join("+")), 0);
         let chat = g.chat_id.as_str();
         let fetched = posts.len();
@@ -807,6 +867,10 @@ impl Scheduler {
         }
 
         for p in fresh {
+            if cycle_started.elapsed() >= self.cfg.cycle_budget {
+                info!(sub = %g.names.join("+"), "cycle delivery budget reached; remaining unseen posts will be picked up next poll");
+                break;
+            }
             if self.token.is_cancelled() {
                 return; // unprocessed posts remain unseen and will be picked up next cycle
             }
@@ -851,9 +915,19 @@ impl Scheduler {
             }
 
             info!(sub = %sub, post = %p.id, "delivery started");
-            let (gallery_index, result) = match &p.media {
-                Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id, g.media_only, 0).await,
-                _ => (0, self.deliverer.deliver(chat, &p, g.media_only).await),
+            let progress = AtomicUsize::new(0);
+            let outcome = timeout(self.cfg.post_delivery_timeout, async {
+                match &p.media {
+                    Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id, g.media_only, 0, &progress).await,
+                    _ => (0, self.deliverer.deliver(chat, &p, g.media_only).await),
+                }
+            }).await;
+            let (gallery_index, result) = match outcome {
+                Ok(result) => result,
+                Err(_) => (
+                    progress.load(Ordering::Relaxed),
+                    Err(anyhow::anyhow!("post delivery timed out after {}s", self.cfg.post_delivery_timeout.as_secs())),
+                ),
             };
             match result {
                 Ok(()) => {

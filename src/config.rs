@@ -108,6 +108,14 @@ pub struct Config {
     pub groups: Vec<Group>,
     pub interval: Duration,
     pub cycle_budget: Duration,
+    /// Maximum wall-clock time allowed for one post, including network and upload work.
+    pub post_delivery_timeout: Duration,
+    /// Total deadline for one Telegram API operation, including fast retries.
+    pub telegram_timeout: Duration,
+    /// Deadline for one media download / Reddit video acquisition operation.
+    pub media_download_timeout: Duration,
+    /// Maximum time spent reading one Reddit gallery metadata page.
+    pub gallery_lookup_timeout: Duration,
     pub post_limit: usize,
     pub request_gap: Duration,
     pub send_gap: Duration,
@@ -164,6 +172,14 @@ fn check_limit(v: usize) -> Result<usize> {
         bail!("post limit must be 1..=50 (got {v})");
     }
     Ok(v)
+}
+
+fn duration_secs(get: Get, key: &str, default: u64, min: u64, max: u64) -> Result<Duration> {
+    let value = num(get, key, default)?;
+    if !(min..=max).contains(&value) {
+        bail!("{key} must be between {min} and {max} seconds (got {value})");
+    }
+    Ok(Duration::from_secs(value))
 }
 
 fn s(get: Get, key: &str, default: &str) -> String {
@@ -311,6 +327,10 @@ impl Config {
             // Stop starting new page loads when this much of the interval is used; the
             // remaining groups continue next cycle (round-robin), so any sub count degrades gracefully.
             cycle_budget: Duration::from_secs(num(get, "CYCLE_BUDGET_SECS", interval_secs * 4 / 5)?.max(30)),
+            post_delivery_timeout: duration_secs(get, "POST_DELIVERY_TIMEOUT_SECS", 180, 15, 600)?,
+            telegram_timeout: duration_secs(get, "TELEGRAM_TIMEOUT_SECS", 120, 10, 600)?,
+            media_download_timeout: duration_secs(get, "MEDIA_DOWNLOAD_TIMEOUT_SECS", 120, 10, 600)?,
+            gallery_lookup_timeout: duration_secs(get, "GALLERY_LOOKUP_TIMEOUT_SECS", 30, 5, 90)?,
             post_limit,
             request_gap: Duration::from_secs(num(get, "REQUEST_GAP_SECS", 5u64)?),
             send_gap: Duration::from_millis(num(get, "SEND_GAP_MS", 3000u64)?),
@@ -499,6 +519,29 @@ mod tests {
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("DEFAULT_CHAT_ID", "@a"), ("SUBREDDITS", "bad/name")], true).is_err());
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("DEFAULT_CHAT_ID", "@a"), ("SUBREDDITS", "a,b,c"), ("MAX_SUBREDDITS", "2")], true).is_err());
         assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("SPOILER_MODE", "nope")], false).is_err());
+    }
+
+    #[test]
+    fn operation_timeouts_have_bounded_defaults_and_overrides() {
+        let defaults = cfg(&[("TELEGRAM_BOT_TOKEN", "x")], false).unwrap();
+        assert_eq!(defaults.post_delivery_timeout, Duration::from_secs(180));
+        assert_eq!(defaults.telegram_timeout, Duration::from_secs(120));
+        assert_eq!(defaults.media_download_timeout, Duration::from_secs(120));
+        assert_eq!(defaults.gallery_lookup_timeout, Duration::from_secs(30));
+
+        let custom = cfg(&[
+            ("TELEGRAM_BOT_TOKEN", "x"),
+            ("POST_DELIVERY_TIMEOUT_SECS", "240"),
+            ("TELEGRAM_TIMEOUT_SECS", "90"),
+            ("MEDIA_DOWNLOAD_TIMEOUT_SECS", "75"),
+            ("GALLERY_LOOKUP_TIMEOUT_SECS", "20"),
+        ], false).unwrap();
+        assert_eq!(custom.post_delivery_timeout, Duration::from_secs(240));
+        assert_eq!(custom.telegram_timeout, Duration::from_secs(90));
+        assert_eq!(custom.media_download_timeout, Duration::from_secs(75));
+        assert_eq!(custom.gallery_lookup_timeout, Duration::from_secs(20));
+        assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("TELEGRAM_TIMEOUT_SECS", "2")], false).is_err());
+        assert!(cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("GALLERY_LOOKUP_TIMEOUT_SECS", "999")], false).is_err());
     }
 
     #[test]

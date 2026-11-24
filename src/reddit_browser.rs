@@ -153,16 +153,17 @@ impl Browser {
             let url = format!("ws://127.0.0.1:{}", self.s.port);
             let mut last = None;
             for _ in 0..60 {
-                match connect_async(url.clone()).await {
-                    Ok((ws, _)) => {
+                // A WebSocket handshake can otherwise remain pending forever. The
+                // outer startup deadline below also caps the complete retry loop.
+                match timeout(Duration::from_secs(3), connect_async(url.clone())).await {
+                    Ok(Ok((ws, _))) => {
                         self.cdp = Some(Cdp { ws, next_id: 0, events: Vec::new() });
                         return Ok(());
                     }
-                    Err(e) => {
-                        last = Some(e);
-                        sleep(Duration::from_millis(500)).await;
-                    }
+                    Ok(Err(e)) => last = Some(anyhow!("CDP WebSocket handshake failed: {e}")),
+                    Err(_) => last = Some(anyhow!("CDP WebSocket handshake timed out")),
                 }
+                sleep(Duration::from_millis(500)).await;
             }
             self.shutdown().await;
             bail!("could not connect to browser CDP: {last:?}");
@@ -181,8 +182,32 @@ impl Browser {
     }
 
     async fn fetch_script(&mut self, url: &str, script: &'static str) -> Result<String> {
-        self.ensure().await?;
-        let pt = self.s.page_timeout;
+        let page_timeout = self.s.page_timeout;
+        self.fetch_script_with_timeout(url, script, page_timeout).await
+    }
+
+    /// Fetches a page using a shorter caller-selected page deadline. The timeout
+    /// is enforced here, not by canceling this future externally, so a timeout
+    /// always closes the Lightpanda process and its in-flight CDP target.
+    pub async fn fetch_text_with_timeout(&mut self, url: &str, page_timeout: Duration) -> Result<String> {
+        self.fetch_script_with_timeout(url, TEXT_JS, page_timeout).await
+    }
+
+    async fn fetch_script_with_timeout(&mut self, url: &str, script: &'static str, pt: Duration) -> Result<String> {
+        // `ensure()` includes spawning Lightpanda and completing the CDP WebSocket
+        // handshake. Keep it inside its own deadline; the page timeout must not
+        // leave startup/connection waits unbounded.
+        match timeout(Duration::from_secs(30), self.ensure()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.shutdown().await;
+                return Err(e);
+            }
+            Err(_) => {
+                self.shutdown().await;
+                bail!("Lightpanda startup/CDP connection timed out after 30s");
+            }
+        }
         let session_cookie = self.s.reddit_session_cookie.clone();
         let cdp = self.cdp.as_mut().ok_or_else(|| anyhow!("no CDP connection"))?;
         let r = timeout(pt, fetch_inner(cdp, url, pt, script, session_cookie.as_deref())).await;

@@ -18,7 +18,7 @@ Your existing Python implementation is untouched: this lives in its own director
 - `telegram.rs` – direct Bot API, streamed multipart uploads, retry on 429 (`retry_after`) / 5xx.
 - `seen_store.rs` – bounded seen IDs and initialized-subreddit markers saved to one local JSON file on the host.
 - `main.rs` – logs to both the Altare console and a separate rotating log file; log files never share the seen-state directory.
-- `scheduler.rs` – sequential cycle every 15 min, exponential backoff on rate limit, per-post failure cap.
+- `scheduler.rs` – sequential polling with a cycle-wide time budget, bounded post delivery, one persisted retry per cycle, and exponential backoff on rate limit / delivery failures.
 - `health.rs`, `self_ping.rs` – `/health` (200/503) and optional best-effort self-ping.
 
 SQLite and remote state services are deliberately not used. The bot stores its bounded state in a local JSON file; it needs no GitHub token, database, or external state service.
@@ -44,9 +44,16 @@ SPOILER_MODE=mark                               # mark | skip | ignore
   spoiler tag; `skip` drops them, `ignore` treats them normally. Detection = old.reddit's spoiler stamp/flair or a
   `[spoiler]` tag in the title — selectors are **unverified** against live Reddit. Documents (oversized images) cannot be overlaid.
 - **Subreddit limit:** default cap 100 (`MAX_SUBREDDITS`, max 500). Memory does not grow with the sub count (sequential,
-  streamed); *time* does. No safe maximum has been measured. Instead the scheduler enforces a per-cycle time budget
-  (`CYCLE_BUDGET_SECS`, default 80% of the interval): when it runs out it stops and continues round-robin next cycle, and logs a warning
-  ("remaining groups run next cycle"). If you see that warning, raise `POLL_INTERVAL_SECS` or trim subs.
+  streamed); *time* does. No safe maximum has been measured. The scheduler enforces `CYCLE_BUDGET_SECS` (default 80% of the
+  interval) across grouped Reddit fetches and post deliveries. It stops starting new work when the budget is exhausted and
+  resumes round-robin next poll. One in-flight post may use up to `POST_DELIVERY_TIMEOUT_SECS` beyond that budget.
+  If the cycle budget is routinely reached, raise `POLL_INTERVAL_SECS` or trim subs.
+- **Timeout guards:** Lightpanda startup/CDP connection is capped at 30 s; each Reddit gallery metadata page is bounded by
+  `GALLERY_LOOKUP_TIMEOUT_SECS`; media acquisition / video probing is bounded by `MEDIA_DOWNLOAD_TIMEOUT_SECS`; each
+  Telegram send (including fast retries) is bounded by `TELEGRAM_TIMEOUT_SECS`; and a post is bounded by
+  `POST_DELIVERY_TIMEOUT_SECS`. Defaults are 30 / 120 / 120 / 180 seconds respectively (gallery / media / Telegram / post).
+  Allowed ranges are validated on startup. Fresh subreddit feeds are checked before the retry queue, and at most one due
+  failed post is retried per cycle so old failures cannot monopolize polling.
 - Telegram sends to one channel are spaced by `SEND_GAP_MS` (3 s) to stay under ~20 messages/minute; a busy 30-sub channel
   may therefore lag. Dirty seen-state data is written locally no more often than `STATE_FLUSH_MIN_SECS`; it is also saved on shutdown.
 - **Host-local persistence:** the default Altare path is `/home/container/data/seen_posts.json`. The directory is created automatically. Keep this path on the server's persistent filesystem; do not put it under a temporary/cache directory. On a host that replaces its entire filesystem on redeploy, mount or select a persistent data directory and set `STATE_PATH` to that location.
