@@ -751,9 +751,8 @@ impl Scheduler {
         } else {
             "https://old.reddit.com"
         };
-        // Reddit's edge currently blocks ordinary /comments/... JSON paths on
-        // Prefer the original route used by the version that successfully
-        // delivered galleries. Encoded permalink routes remain available as fallbacks.
+        // Use the original comments JSON route first; encoded permalink routes
+        // are retained as fallbacks for hosts that block the original endpoint.
         let canonical_permalink = p.permalink
             .replace("http://old.reddit.com", "https://www.reddit.com")
             .replace("https://old.reddit.com", "https://www.reddit.com");
