@@ -3,7 +3,7 @@ use crate::{
     health::Health,
     media_downloader as md,
     reddit_browser::Browser,
-    reddit_parser::{parse_gallery, parse_page, GalleryItem, GalleryKind, Media, PageStatus, Post},
+    reddit_parser::{parse_gallery, parse_gallery_dom, parse_page, GalleryItem, GalleryKind, Media, PageStatus, Post},
     seen_store::{PendingDelivery, SeenStore},
     telegram::{FileKind, Telegram, TgError},
 };
