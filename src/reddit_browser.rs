@@ -130,9 +130,9 @@ pub const GALLERY_JS: &str = r#"(() => {
 
     const img = li.querySelector('img.media-lightbox-img') || li.querySelector('img');
     if (!img) continue;
-    const raw = img.getAttribute('data-lazy-src')
+    const raw = img.currentSrc
+      || img.getAttribute('data-lazy-src')
       || img.getAttribute('src')
-      || img.currentSrc
       || '';
     const url = cleanImage(raw);
     if (!allowedImage(url)) continue;
