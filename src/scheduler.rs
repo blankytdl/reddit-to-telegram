@@ -451,6 +451,46 @@ impl Deliverer {
 
 // ---------- scheduler ----------
 
+/// Build a post JSON URL that avoids Reddit's currently blocked literal
+/// "/comments/" path signature by encoding the slash before "comments".
+/// The subreddit path and post id are validated because this URL is derived
+/// from listing content and is used only against Reddit's known hosts.
+fn encoded_permalink_json_url(permalink: &str, base: &str) -> Option<String> {
+    let path = permalink
+        .strip_prefix("https://www.reddit.com")
+        .or_else(|| permalink.strip_prefix("https://old.reddit.com"))
+        .or_else(|| permalink.strip_prefix("https://reddit.com"))?;
+    let path = path.split(['?', '#']).next()?.trim_end_matches('/');
+    let (subreddit_path, rest) = path.split_once("/comments/")?;
+    let subreddit = subreddit_path.strip_prefix("/r/")?;
+    if subreddit.is_empty()
+        || subreddit.contains('/')
+        || !subreddit.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+
+    let (id, slug) = match rest.split_once('/') {
+        Some((id, slug)) => (id, slug.trim_matches('/')),
+        None => (rest, ""),
+    };
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+
+    let suffix = if slug.is_empty() {
+        format!("{id}.json")
+    } else {
+        format!("{id}/{slug}.json")
+    };
+    Some(format!(
+        "{}{}%2fcomments/{}?raw_json=1",
+        base.trim_end_matches('/'),
+        subreddit_path,
+        suffix
+    ))
+}
+
 pub struct Scheduler {
     cfg: Arc<Config>,
     browser: Browser,
@@ -678,10 +718,22 @@ impl Scheduler {
         } else {
             "https://old.reddit.com"
         };
-        let urls = [
-            format!("{primary_base}/comments/{id}.json?raw_json=1"),
-            format!("{alternate_base}/comments/{id}.json?raw_json=1"),
-        ];
+        // Reddit's edge currently blocks ordinary /comments/... JSON paths on
+        // some hosted networks. Its path rule has been observed to allow the same
+        // post JSON when the slash before "comments" is percent-encoded in the
+        // subreddit permalink: /r/<sub>%2fcomments/<id>/<slug>.json.
+        let canonical_permalink = p.permalink
+            .replace("http://old.reddit.com", "https://www.reddit.com")
+            .replace("https://old.reddit.com", "https://www.reddit.com");
+        let mut urls = Vec::new();
+        for base in [primary_base, alternate_base] {
+            if let Some(url) = encoded_permalink_json_url(&canonical_permalink, base) {
+                urls.push(url);
+            }
+        }
+        // Retain the previous direct routes as a compatibility fallback.
+        urls.push(format!("{primary_base}/comments/{id}.json?raw_json=1"));
+        urls.push(format!("{alternate_base}/comments/{id}.json?raw_json=1"));
 
         let mut last_error = None;
         let mut network_security_blocks = 0usize;
@@ -690,7 +742,8 @@ impl Scheduler {
                 sleep(self.cfg.request_gap).await;
             }
 
-            info!(post = %p.id, attempt = index + 1, "gallery metadata lookup started");
+            let route = if url.contains("%2fcomments/") { "encoded_permalink" } else { "legacy_comments" };
+            info!(post = %p.id, attempt = index + 1, route, "gallery metadata lookup started");
             let body = match self.browser.fetch_text_with_timeout(url, self.cfg.gallery_lookup_timeout).await {
                 Ok(body) => body,
                 Err(e) => {
@@ -722,7 +775,7 @@ impl Scheduler {
         // The JSON route can be denied while Reddit's ordinary HTML page remains
         // available. In that case read the rendered carousel DOM instead of
         // silently dropping the gallery or trying to disguise the blocked URL.
-        if network_security_blocks == urls.len() {
+        if network_security_blocks > 0 {
             // Prefer the full canonical post permalink: the new Reddit post-detail
             // view loads its gallery asynchronously through post_detail_gallery.
             let permalink = p.permalink
@@ -1120,6 +1173,43 @@ mod tests {
             p = next_penalty(p);
         }
         assert_eq!(p.as_secs(), 3600);
+    }
+
+    #[test]
+    fn encoded_permalink_json_url_uses_percent_encoded_comments_separator() {
+        let url = encoded_permalink_json_url(
+            "https://www.reddit.com/r/visualnovels/comments/1y45dw7/karakara3/?rdt=35537",
+            "https://www.reddit.com",
+        ).unwrap();
+        assert_eq!(
+            url,
+            "https://www.reddit.com/r/visualnovels%2fcomments/1y45dw7/karakara3.json?raw_json=1"
+        );
+
+        let old_host = encoded_permalink_json_url(
+            "https://old.reddit.com/r/BlueArchive/comments/1y4114l/",
+            "https://old.reddit.com",
+        ).unwrap();
+        assert_eq!(
+            old_host,
+            "https://old.reddit.com/r/BlueArchive%2fcomments/1y4114l.json?raw_json=1"
+        );
+    }
+
+    #[test]
+    fn encoded_permalink_json_url_rejects_non_reddit_or_malformed_paths() {
+        assert!(encoded_permalink_json_url(
+            "https://evil.example/r/anime/comments/abc/slug/",
+            "https://www.reddit.com",
+        ).is_none());
+        assert!(encoded_permalink_json_url(
+            "https://www.reddit.com/comments/abc/slug/",
+            "https://www.reddit.com",
+        ).is_none());
+        assert!(encoded_permalink_json_url(
+            "https://www.reddit.com/r/anime/comments/not-valid/slug/",
+            "https://www.reddit.com",
+        ).is_none());
     }
 
     #[test]
