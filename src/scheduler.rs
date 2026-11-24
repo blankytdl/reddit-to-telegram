@@ -491,6 +491,39 @@ fn encoded_permalink_json_url(permalink: &str, base: &str) -> Option<String> {
     ))
 }
 
+/// Keep the previously working gallery JSON endpoint first. Newer routes are
+/// fallbacks only, so the original configured Reddit host gets the first chance.
+fn gallery_metadata_urls(
+    permalink: &str,
+    id: &str,
+    primary_base: &str,
+    alternate_base: &str,
+) -> Vec<(String, &'static str)> {
+    let primary = primary_base.trim_end_matches('/');
+    let alternate = alternate_base.trim_end_matches('/');
+    let mut urls = vec![(
+        format!("{primary}/comments/{id}.json?raw_json=1"),
+        "legacy_comments_primary",
+    )];
+
+    for (base, route) in [
+        (primary, "encoded_permalink_primary"),
+        (alternate, "encoded_permalink_alternate"),
+    ] {
+        if let Some(url) = encoded_permalink_json_url(permalink, base) {
+            if !urls.iter().any(|(existing, _)| existing == &url) {
+                urls.push((url, route));
+            }
+        }
+    }
+
+    let alternate_legacy = format!("{alternate}/comments/{id}.json?raw_json=1");
+    if !urls.iter().any(|(existing, _)| existing == &alternate_legacy) {
+        urls.push((alternate_legacy, "legacy_comments_alternate"));
+    }
+    urls
+}
+
 pub struct Scheduler {
     cfg: Arc<Config>,
     browser: Browser,
@@ -719,32 +752,35 @@ impl Scheduler {
             "https://old.reddit.com"
         };
         // Reddit's edge currently blocks ordinary /comments/... JSON paths on
-        // some hosted networks. Its path rule has been observed to allow the same
-        // post JSON when the slash before "comments" is percent-encoded in the
-        // subreddit permalink: /r/<sub>%2fcomments/<id>/<slug>.json.
+        // Prefer the original route used by the version that successfully
+        // delivered galleries. Encoded permalink routes remain available as fallbacks.
         let canonical_permalink = p.permalink
             .replace("http://old.reddit.com", "https://www.reddit.com")
             .replace("https://old.reddit.com", "https://www.reddit.com");
-        let mut urls = Vec::new();
-        for base in [primary_base, alternate_base] {
-            if let Some(url) = encoded_permalink_json_url(&canonical_permalink, base) {
-                urls.push(url);
-            }
-        }
-        // Retain the previous direct routes as a compatibility fallback.
-        urls.push(format!("{primary_base}/comments/{id}.json?raw_json=1"));
-        urls.push(format!("{alternate_base}/comments/{id}.json?raw_json=1"));
+        let urls = gallery_metadata_urls(
+            &canonical_permalink,
+            id,
+            primary_base,
+            alternate_base,
+        );
 
         let mut last_error = None;
         let mut network_security_blocks = 0usize;
-        for (index, url) in urls.iter().enumerate() {
+        for (index, (url, route)) in urls.iter().enumerate() {
             if index > 0 {
                 sleep(self.cfg.request_gap).await;
             }
 
-            let route = if url.contains("%2fcomments/") { "encoded_permalink" } else { "legacy_comments" };
-            info!(post = %p.id, attempt = index + 1, route, "gallery metadata lookup started");
-            let body = match self.browser.fetch_text_with_timeout(url, self.cfg.gallery_lookup_timeout).await {
+            info!(post = %p.id, attempt = index + 1, route = *route, "gallery metadata lookup started");
+            // The first route intentionally uses the general page timeout, as the
+            // original implementation did (90s by default). Faster bounded timeouts
+            // remain in place for the additional fallback routes.
+            let fetch = if index == 0 {
+                self.browser.fetch_text(url).await
+            } else {
+                self.browser.fetch_text_with_timeout(url, self.cfg.gallery_lookup_timeout).await
+            };
+            let body = match fetch {
                 Ok(body) => body,
                 Err(e) => {
                     last_error = Some(e);
@@ -1194,6 +1230,27 @@ mod tests {
             old_host,
             "https://old.reddit.com/r/BlueArchive%2fcomments/1y4114l.json?raw_json=1"
         );
+    }
+
+    #[test]
+    fn original_gallery_json_route_is_first_and_fallbacks_are_retained() {
+        let urls = gallery_metadata_urls(
+            "https://www.reddit.com/r/MoeDesktop/comments/1y42nx5/my_custom_mogeko_castle_pack/",
+            "1y42nx5",
+            "https://old.reddit.com",
+            "https://www.reddit.com",
+        );
+        assert_eq!(
+            urls[0],
+            (
+                "https://old.reddit.com/comments/1y42nx5.json?raw_json=1".to_string(),
+                "legacy_comments_primary",
+            )
+        );
+        assert_eq!(urls.len(), 4);
+        assert_eq!(urls[1].1, "encoded_permalink_primary");
+        assert_eq!(urls[2].1, "encoded_permalink_alternate");
+        assert_eq!(urls[3].1, "legacy_comments_alternate");
     }
 
     #[test]
