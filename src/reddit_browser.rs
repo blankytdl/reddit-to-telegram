@@ -160,7 +160,7 @@ impl Browser {
                         self.cdp = Some(Cdp { ws, next_id: 0, events: Vec::new() });
                         return Ok(());
                     }
-                    Ok(Err(e)) => last = Some(e),
+                    Ok(Err(e)) => last = Some(anyhow!("CDP WebSocket handshake failed: {e}")),
                     Err(_) => last = Some(anyhow!("CDP WebSocket handshake timed out")),
                 }
                 sleep(Duration::from_millis(500)).await;
@@ -182,7 +182,8 @@ impl Browser {
     }
 
     async fn fetch_script(&mut self, url: &str, script: &'static str) -> Result<String> {
-        self.fetch_script_with_timeout(url, script, self.s.page_timeout).await
+        let page_timeout = self.s.page_timeout;
+        self.fetch_script_with_timeout(url, script, page_timeout).await
     }
 
     /// Fetches a page using a shorter caller-selected page deadline. The timeout
