@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::{fmt, future::Future, path::Path, time::Duration};
 use tokio::time::{sleep, timeout, Instant};
 use tokio_util::io::ReaderStream;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -149,10 +149,15 @@ impl Telegram {
             "chat_id": chat, "text": html, "parse_mode": "HTML", "disable_web_page_preview": false
         });
         let (url, body) = (&url, &body);
-        self.retry(self.operation_timeout.min(Duration::from_secs(30)), move || async move {
+        let started = Instant::now();
+        let result = self.retry(self.operation_timeout.min(Duration::from_secs(30)), move || async move {
             Self::parse(self.client.post(url).json(body).timeout(self.operation_timeout.min(Duration::from_secs(30))).send().await).await
-        })
-        .await
+        }).await;
+        match &result {
+            Ok(()) => info!(elapsed_ms = started.elapsed().as_millis(), "Telegram message delivered"),
+            Err(e) => warn!(code = e.code, elapsed_ms = started.elapsed().as_millis(), reason = %e, "Telegram message failed"),
+        }
+        result
     }
 
     async fn upload_once(&self, url: &str, chat: &str, kind: FileKind, path: &Path, caption: &str, spoiler: bool) -> Result<(), TgError> {
@@ -174,7 +179,13 @@ impl Telegram {
     pub async fn send_file(&self, chat: &str, kind: FileKind, path: &Path, caption: &str, spoiler: bool) -> Result<(), TgError> {
         let url = self.url(kind.method());
         let url = &url;
-        self.retry(self.operation_timeout, move || self.upload_once(url, chat, kind, path, caption, spoiler)).await
+        let started = Instant::now();
+        let result = self.retry(self.operation_timeout, move || self.upload_once(url, chat, kind, path, caption, spoiler)).await;
+        match &result {
+            Ok(()) => info!(kind = ?kind, elapsed_ms = started.elapsed().as_millis(), "Telegram media upload delivered"),
+            Err(e) => warn!(kind = ?kind, code = e.code, elapsed_ms = started.elapsed().as_millis(), reason = %e, "Telegram media upload failed"),
+        }
+        result
     }
 
     async fn group_once(&self, url: &str, chat: &str, files: &[&Path], caption: &str, spoiler: bool) -> Result<(), TgError> {
@@ -201,6 +212,12 @@ impl Telegram {
     pub async fn send_media_group(&self, chat: &str, files: &[&Path], caption: &str, spoiler: bool) -> Result<(), TgError> {
         let url = self.url("sendMediaGroup");
         let url = &url;
-        self.retry(self.operation_timeout, move || self.group_once(url, chat, files, caption, spoiler)).await
+        let started = Instant::now();
+        let result = self.retry(self.operation_timeout, move || self.group_once(url, chat, files, caption, spoiler)).await;
+        match &result {
+            Ok(()) => info!(photos = files.len(), elapsed_ms = started.elapsed().as_millis(), "Telegram photo album delivered"),
+            Err(e) => warn!(photos = files.len(), code = e.code, elapsed_ms = started.elapsed().as_millis(), reason = %e, "Telegram photo album failed"),
+        }
+        result
     }
 }
