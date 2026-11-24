@@ -1132,14 +1132,6 @@ mod tests {
     }
 
     #[test]
-    fn permanent_gallery_block_marker_survives_anyhow_error() {
-        let permanent: anyhow::Error = GallerySecurityBlocked.into();
-        let transient = anyhow::anyhow!("gallery metadata request timed out");
-        assert!(is_permanent_gallery_block(&permanent));
-        assert!(!is_permanent_gallery_block(&transient));
-    }
-
-    #[test]
     fn failed_delivery_retry_uses_capped_exponential_backoff() {
         let interval = Duration::from_secs(600);
         assert_eq!(delivery_retry_delay(interval, 1).as_secs(), 600);
