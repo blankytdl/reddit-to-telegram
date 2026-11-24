@@ -58,47 +58,106 @@ pub const TEXT_JS: &str = r#"(() => {
 /// Extract all media from Reddit's normal HTML gallery page. This is a DOM
 /// fallback for networks where Reddit's comments .json document is unavailable.
 pub const GALLERY_JS: &str = r#"(() => {
-  const postCandidates = Array.from(document.querySelectorAll('shreddit-post[post-type="gallery"], shreddit-post'));
-  const post = postCandidates.find(el => el.querySelector('gallery-carousel, shreddit-gallery-carousel'));
-  const carousel = (post && post.querySelector('gallery-carousel, shreddit-gallery-carousel'))
-    || document.querySelector('gallery-carousel, shreddit-gallery-carousel');
-  if (!carousel) return JSON.stringify({ items: [] });
+  // Reddit inserts gallery-carousel asynchronously through
+  // shreddit-async-loader[bundlename="post_detail_gallery"].
+  // Wait for that loader and traverse open shadow roots where present.
+  const deepFind = (root, selector) => {
+    if (!root) return null;
+    try {
+      const direct = root.querySelector && root.querySelector(selector);
+      if (direct) return direct;
+      if (root.shadowRoot) {
+        const nested = deepFind(root.shadowRoot, selector);
+        if (nested) return nested;
+      }
+      const elements = root.querySelectorAll ? root.querySelectorAll('*') : [];
+      for (const el of elements) {
+        if (el.shadowRoot) {
+          const nested = deepFind(el.shadowRoot, selector);
+          if (nested) return nested;
+        }
+      }
+    } catch (_) {}
+    return null;
+  };
+  const deepAll = (root, selector) => {
+    const out = [];
+    const seen = new Set();
+    const visit = scope => {
+      if (!scope || seen.has(scope)) return;
+      seen.add(scope);
+      try {
+        if (scope.querySelectorAll) {
+          for (const node of scope.querySelectorAll(selector)) out.push(node);
+          const elements = scope.querySelectorAll('*');
+          for (const el of elements) if (el.shadowRoot) visit(el.shadowRoot);
+        }
+        if (scope.shadowRoot) visit(scope.shadowRoot);
+      } catch (_) {}
+    };
+    visit(root);
+    return out;
+  };
 
   const allowedImage = u => /^https:\/\/(?:i|preview|external-preview)\.redd\.it\//i.test(u);
-  const allowedVideo = u => /^https:\/\/v\.redd\.it\//i.test(u);
+  const allowedVideo = u => /^https:\/\/(?:v|preview|external-preview)\.redd\.it\//i.test(u);
   const cleanImage = raw => {
     if (!raw) return '';
     let u = String(raw).replace(/&amp;/g, '&');
-    u = u.replace(/^https:\/\/(?:preview|external-preview)\.redd\.it\//i, 'https://i.redd.it/');
-    u = u.split('#')[0].split('?')[0];
-    const slug = u.match(/\/([^/]+)-v0-([a-z0-9]+\.(?:jpe?g|png|gif|webp))$/i);
-    if (slug) u = u.replace(slug[1] + '-v0-', '');
+    if (u.startsWith('//')) u = 'https:' + u;
+    // Reddit's original image is the filename after the optional v0 marker.
+    try {
+      const parsed = new URL(u);
+      if (/^(preview|external-preview)\.redd\.it$/i.test(parsed.hostname)) {
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        let file = parts[parts.length - 1] || '';
+        const marker = file.lastIndexOf('-v0-');
+        if (marker >= 0) file = file.slice(marker + 4);
+        if (/\.(jpe?g|png|gif|webp)$/i.test(file)) return 'https://i.redd.it/' + file;
+      }
+    } catch (_) {}
     return u;
   };
-  const out = [];
-  const seen = new Set();
-  const add = (url, kind) => {
-    if (!url) return;
-    const clean = String(url).replace(/&amp;/g, '&');
-    const ok = kind === 'photo' || kind === 'animation'
-      ? allowedImage(clean)
-      : allowedVideo(clean);
-    if (!ok || seen.has(clean)) return;
-    seen.add(clean);
-    out.push({ url: clean, kind });
-  };
 
-  const slides = Array.from(carousel.querySelectorAll('li'));
-  for (const li of slides) {
-    const player = li.querySelector('shreddit-player');
-    if (player) {
+  const extract = () => {
+    const posts = deepAll(document, 'shreddit-post');
+    const post = posts.find(el => (el.getAttribute('post-type') || '').toLowerCase() === 'gallery')
+      || posts.find(el => el.getAttribute('post-id') || el.getAttribute('id'));
+    const loaderSelector = 'shreddit-async-loader[bundlename="post_detail_gallery"], shreddit-async-loader[bundlename="gallery_carousel"]';
+    const loader = (post && deepFind(post, loaderSelector)) || deepFind(document, loaderSelector);
+    const carousel = (loader && deepFind(loader, 'gallery-carousel, shreddit-gallery-carousel'))
+      || (post && deepFind(post, 'gallery-carousel, shreddit-gallery-carousel'))
+      || deepFind(document, 'gallery-carousel, shreddit-gallery-carousel');
+
+    const out = [];
+    const seen = new Set();
+    const add = (raw, kind) => {
+      if (!raw) return;
+      const url = String(raw).replace(/&amp;/g, '&');
+      const valid = kind === 'photo' || kind === 'animation' ? allowedImage(url) : allowedVideo(url);
+      if (!valid || seen.has(url)) return;
+      seen.add(url);
+      out.push({ url, kind });
+    };
+
+    let slides = carousel ? deepAll(carousel, 'ul > li[slot^="page-"], ul > li, li[slot^="page-"]') : [];
+    slides = Array.from(new Set(slides));
+    let imageCount = 0;
+    let playerCount = 0;
+
+    for (const slide of slides) {
+      const players = deepAll(slide, 'shreddit-player, shreddit-player-2, shreddit-player-static, shreddit-player-static-hlsjs');
+      const videos = deepAll(slide, 'video');
+      const player = players[0];
+      if (player) playerCount++;
+
       let videoUrl = '';
-      const packaged = player.getAttribute('packaged-media-json');
+      const packaged = player && player.getAttribute('packaged-media-json');
       if (packaged) {
         try {
           const parsed = JSON.parse(packaged);
           const playback = parsed && parsed.playbackMp4s;
-          const permutations = playback && Array.isArray(playback.permutations) ? playback.permutations : [];
+          const permutations = playback && Array.isArray(playback.permutations) ? playback.permutations.slice() : [];
           permutations.sort((a, b) =>
             ((b.source && b.source.dimensions && b.source.dimensions.height) || 0) -
             ((a.source && a.source.dimensions && a.source.dimensions.height) || 0));
@@ -111,35 +170,68 @@ pub const GALLERY_JS: &str = r#"(() => {
           }
         } catch (_) {}
       }
-      if (!videoUrl) {
-        const video = li.querySelector('video source[src], video[src]');
-        const candidate = (video && (video.getAttribute('src') || video.src))
-          || player.getAttribute('src') || '';
-        if (allowedVideo(candidate)) videoUrl = candidate;
+      if (!videoUrl && player) {
+        const source = deepFind(player, 'video source[src], source[src], video[src]');
+        videoUrl = (source && (source.getAttribute('src') || source.src))
+          || player.getAttribute('src')
+          || player.getAttribute('preview')
+          || '';
       }
-      if (videoUrl) add(videoUrl, /\.mpd(?:\?|$)/i.test(videoUrl) ? 'dash_video' : 'video');
-      continue;
+      if (!videoUrl && videos.length) {
+        const video = videos[0];
+        const source = deepFind(video, 'source[src]');
+        videoUrl = (source && (source.getAttribute('src') || source.src))
+          || video.getAttribute('src') || video.src || '';
+      }
+      if (videoUrl && allowedVideo(videoUrl)) {
+        add(videoUrl, /\.mpd(?:\?|$)/i.test(videoUrl) || /\.m3u8(?:\?|$)/i.test(videoUrl) ? 'dash_video' : 'video');
+        continue;
+      }
+
+      const imgs = deepAll(slide, 'figure img, img');
+      const img = imgs.find(el => {
+        const candidate = cleanImage(el.currentSrc || el.getAttribute('data-lazy-src') || el.getAttribute('src') || '');
+        return allowedImage(candidate);
+      });
+      if (img) {
+        imageCount++;
+        const url = cleanImage(img.currentSrc || img.getAttribute('data-lazy-src') || img.getAttribute('src') || '');
+        add(url, /\.gif(?:[?#]|$)/i.test(url) ? 'animation' : 'photo');
+      }
     }
 
-    const video = li.querySelector('video source[src], video[src]');
-    const videoUrl = video && (video.getAttribute('src') || video.src);
-    if (videoUrl && allowedVideo(videoUrl)) {
-      add(videoUrl, /\.mpd(?:\?|$)/i.test(videoUrl) ? 'dash_video' : 'video');
-      continue;
-    }
+    return {
+      items: out,
+      diagnostics: {
+        pageUrl: location.href || '',
+        postCount: posts.length,
+        galleryPostFound: !!post,
+        loaderFound: !!loader,
+        carouselFound: !!carousel,
+        slideCount: slides.length,
+        imageCount,
+        playerCount
+      }
+    };
+  };
 
-    const img = li.querySelector('img.media-lightbox-img') || li.querySelector('img');
-    if (!img) continue;
-    const raw = img.currentSrc
-      || img.getAttribute('data-lazy-src')
-      || img.getAttribute('src')
-      || '';
-    const url = cleanImage(raw);
-    if (!allowedImage(url)) continue;
-    add(url, /\.gif$/i.test(url) ? 'animation' : 'photo');
-  }
-
-  return JSON.stringify({ items: out });
+  return new Promise(resolve => {
+    const started = Date.now();
+    const deadlineMs = 7000;
+    const tick = () => {
+      let result;
+      try { result = extract(); }
+      catch (error) {
+        result = { items: [], diagnostics: { pageUrl: location.href || '', extractionError: String(error) } };
+      }
+      if ((result.items && result.items.length > 0) || Date.now() - started >= deadlineMs) {
+        resolve(JSON.stringify(result));
+      } else {
+        setTimeout(tick, 200);
+      }
+    };
+    tick();
+  });
 })()"#;
 
 struct Cdp {
