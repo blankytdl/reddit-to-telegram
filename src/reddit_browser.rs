@@ -153,16 +153,17 @@ impl Browser {
             let url = format!("ws://127.0.0.1:{}", self.s.port);
             let mut last = None;
             for _ in 0..60 {
-                match connect_async(url.clone()).await {
-                    Ok((ws, _)) => {
+                // A WebSocket handshake can otherwise remain pending forever. The
+                // outer startup deadline below also caps the complete retry loop.
+                match timeout(Duration::from_secs(3), connect_async(url.clone())).await {
+                    Ok(Ok((ws, _))) => {
                         self.cdp = Some(Cdp { ws, next_id: 0, events: Vec::new() });
                         return Ok(());
                     }
-                    Err(e) => {
-                        last = Some(e);
-                        sleep(Duration::from_millis(500)).await;
-                    }
+                    Ok(Err(e)) => last = Some(e),
+                    Err(_) => last = Some(anyhow!("CDP WebSocket handshake timed out")),
                 }
+                sleep(Duration::from_millis(500)).await;
             }
             self.shutdown().await;
             bail!("could not connect to browser CDP: {last:?}");
@@ -181,7 +182,20 @@ impl Browser {
     }
 
     async fn fetch_script(&mut self, url: &str, script: &'static str) -> Result<String> {
-        self.ensure().await?;
+        // `ensure()` includes spawning Lightpanda and completing the CDP WebSocket
+        // handshake. Keep it inside its own deadline; the page timeout must not
+        // leave startup/connection waits unbounded.
+        match timeout(Duration::from_secs(30), self.ensure()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.shutdown().await;
+                return Err(e);
+            }
+            Err(_) => {
+                self.shutdown().await;
+                bail!("Lightpanda startup/CDP connection timed out after 30s");
+            }
+        }
         let pt = self.s.page_timeout;
         let session_cookie = self.s.reddit_session_cookie.clone();
         let cdp = self.cdp.as_mut().ok_or_else(|| anyhow!("no CDP connection"))?;
