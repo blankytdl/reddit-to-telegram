@@ -669,14 +669,10 @@ impl Scheduler {
                 sleep(self.cfg.request_gap).await;
             }
 
-            let body = match timeout(self.cfg.gallery_lookup_timeout, self.browser.fetch_text(url)).await {
-                Ok(Ok(body)) => body,
-                Ok(Err(e)) => {
+            let body = match self.browser.fetch_text_with_timeout(url, self.cfg.gallery_lookup_timeout).await {
+                Ok(body) => body,
+                Err(e) => {
                     last_error = Some(e);
-                    continue;
-                }
-                Err(_) => {
-                    last_error = Some(anyhow::anyhow!("gallery metadata lookup timed out after {}s", self.cfg.gallery_lookup_timeout.as_secs()));
                     continue;
                 }
             };
