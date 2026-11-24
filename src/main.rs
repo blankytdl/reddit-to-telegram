@@ -185,7 +185,7 @@ async fn run() -> Result<()> {
         info!("self-ping disabled (not on Render or SELF_PING_ENABLED=false)");
     }
 
-    let tg = telegram::Telegram::new(http.clone(), cfg.telegram_base.clone(), cfg.telegram_token.clone());
+    let tg = telegram::Telegram::new(http.clone(), cfg.telegram_base.clone(), cfg.telegram_token.clone(), cfg.telegram_timeout);
     let sched = scheduler::Scheduler::new(
         cfg.clone(),
         reddit_browser::Browser::new(cfg.browser.clone()),
@@ -242,7 +242,7 @@ async fn media_test(args: &[String]) -> Result<()> {
     let url = args.get(3).ok_or_else(|| anyhow!("usage: media-test <chat_id> <media_url> [spoiler]"))?;
     let cfg = Arc::new(Config::from_env(false)?);
     let http = http_client()?;
-    let tg = telegram::Telegram::new(http.clone(), cfg.telegram_base.clone(), cfg.telegram_token.clone());
+    let tg = telegram::Telegram::new(http.clone(), cfg.telegram_base.clone(), cfg.telegram_token.clone(), cfg.telegram_timeout);
     let d = scheduler::Deliverer::new(cfg.clone(), http, tg);
     let post = reddit_parser::Post {
         id: "t3_mediatest".into(),
