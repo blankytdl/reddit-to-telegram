@@ -11,6 +11,7 @@ use anyhow::{bail, Result};
 use reqwest::Client;
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     path::Path,
     sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -119,6 +120,26 @@ fn retry_as_document(e: &TgError, kind: FileKind) -> bool {
 }
 
 // ---------- delivery ----------
+
+/// Marker for a specific, persistent Reddit response that cannot be retried usefully.
+#[derive(Debug)]
+struct GallerySecurityBlocked;
+
+impl fmt::Display for GallerySecurityBlocked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("both canonical Reddit hosts explicitly blocked gallery metadata with a network-security page")
+    }
+}
+
+impl std::error::Error for GallerySecurityBlocked {}
+
+fn is_permanent_gallery_block(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<GallerySecurityBlocked>().is_some()
+}
+
+fn is_reddit_network_security_block(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("blocked by network security")
+}
 
 /// Per-image download cap for gallery items (an album holds up to 10 temp files at once).
 const GALLERY_ITEM_MAX: u64 = 25 * 1024 * 1024;
@@ -677,6 +698,7 @@ impl Scheduler {
         ];
 
         let mut last_error = None;
+        let mut network_security_blocks = 0usize;
         for (index, url) in urls.iter().enumerate() {
             if index > 0 {
                 sleep(self.cfg.request_gap).await;
@@ -691,6 +713,12 @@ impl Scheduler {
                 }
             };
 
+            if is_reddit_network_security_block(&body) {
+                network_security_blocks += 1;
+                last_error = Some(anyhow::anyhow!("Reddit returned an explicit network-security block page for gallery metadata"));
+                continue;
+            }
+
             if body.to_ascii_lowercase().contains("too many requests") {
                 last_error = Some(anyhow::anyhow!("Reddit rate-limited the gallery metadata request"));
                 break;
@@ -703,6 +731,16 @@ impl Scheduler {
                     last_error = Some(anyhow::anyhow!("{e:#}; response prefix: {prefix:?}"));
                 }
             }
+        }
+
+        if media_only && network_security_blocks == urls.len() {
+            warn!(
+                post = %p.id,
+                gallery_index = start_index,
+                partial_gallery = start_index > 0,
+                "both canonical Reddit hosts returned explicit network-security blocks; permanently skipping media-only gallery"
+            );
+            return (start_index, Err(GallerySecurityBlocked.into()));
         }
 
         let error = last_error.unwrap_or_else(|| anyhow::anyhow!("Reddit returned no gallery metadata"));
@@ -783,6 +821,18 @@ impl Scheduler {
                     self.store.remove_pending(&chat, &id);
                     self.store.flush().await;
                     info!(post = %id, "persisted retry delivered");
+                }
+                Err(error) if is_permanent_gallery_block(&error) => {
+                    self.mark_seen(&chat, &id);
+                    self.store.remove_pending(&chat, &id);
+                    self.store.flush().await;
+                    warn!(
+                        post = %id,
+                        gallery_index,
+                        partial_gallery = gallery_index > 0,
+                        reason = %error,
+                        "permanently skipped blocked gallery and removed it from the retry queue"
+                    );
                 }
                 Err(error) => {
                     item.attempts = item.attempts.saturating_add(1);
@@ -939,6 +989,20 @@ impl Scheduler {
                     self.store.remove_pending(chat, &p.id);
                     sent += 1;
                 }
+                Err(error) if is_permanent_gallery_block(&error) => {
+                    self.mark_seen(chat, &p.id);
+                    self.store.remove_pending(chat, &p.id);
+                    self.store.flush().await;
+                    skipped += 1;
+                    warn!(
+                        sub = %sub,
+                        post = %p.id,
+                        gallery_index,
+                        partial_gallery = gallery_index > 0,
+                        reason = %error,
+                        "permanently skipped blocked gallery; it will not be retried automatically"
+                    );
+                }
                 Err(error) => {
                     failed += 1;
                     let delay = delivery_retry_delay(self.cfg.interval, 1);
@@ -1069,6 +1133,30 @@ mod tests {
             p = next_penalty(p);
         }
         assert_eq!(p.as_secs(), 3600);
+    }
+
+    #[test]
+    fn reddit_network_security_block_detection_is_specific() {
+        assert!(is_reddit_network_security_block(
+            "You've been blocked by network security. If you think this is a mistake..."
+        ));
+        assert!(is_reddit_network_security_block(
+            "ERROR: BLOCKED BY NETWORK SECURITY"
+        ));
+        assert!(!is_reddit_network_security_block(
+            "Too Many Requests - rate limit exceeded"
+        ));
+        assert!(!is_reddit_network_security_block(
+            "gallery response was not valid JSON"
+        ));
+    }
+
+    #[test]
+    fn permanent_gallery_block_marker_survives_anyhow_error() {
+        let permanent: anyhow::Error = GallerySecurityBlocked.into();
+        let transient = anyhow::anyhow!("gallery metadata request timed out");
+        assert!(is_permanent_gallery_block(&permanent));
+        assert!(!is_permanent_gallery_block(&transient));
     }
 
     #[test]
