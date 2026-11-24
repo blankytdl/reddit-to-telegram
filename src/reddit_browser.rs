@@ -96,7 +96,9 @@ pub const GALLERY_JS: &str = r#"(() => {
       const packaged = player.getAttribute('packaged-media-json');
       if (packaged) {
         try {
-          const permutations = JSON.parse(packaged).playbackMp4s?.permutations || [];
+          const parsed = JSON.parse(packaged);
+          const playback = parsed && parsed.playbackMp4s;
+          const permutations = playback && Array.isArray(playback.permutations) ? playback.permutations : [];
           permutations.sort((a, b) =>
             ((b.source && b.source.dimensions && b.source.dimensions.height) || 0) -
             ((a.source && a.source.dimensions && a.source.dimensions.height) || 0));
