@@ -723,7 +723,13 @@ impl Scheduler {
         // available. In that case read the rendered carousel DOM instead of
         // silently dropping the gallery or trying to disguise the blocked URL.
         if network_security_blocks == urls.len() {
+            // Prefer the full canonical post permalink: the new Reddit post-detail
+            // view loads its gallery asynchronously through post_detail_gallery.
+            let permalink = p.permalink
+                .replace("https://old.reddit.com", "https://www.reddit.com")
+                .replace("http://old.reddit.com", "https://www.reddit.com");
             let html_urls = [
+                permalink,
                 format!("https://www.reddit.com/gallery/{id}"),
                 format!("https://old.reddit.com/comments/{id}/"),
             ];
@@ -739,6 +745,7 @@ impl Scheduler {
                             return self.deliverer.deliver_gallery(chat, p, &items, start_index, progress).await;
                         }
                         Err(error) => {
+                            warn!(post = %p.id, reason = %error, "gallery HTML did not expose its carousel yet");
                             last_error = Some(anyhow::anyhow!("HTML gallery extraction failed: {error:#}"));
                         }
                     },
