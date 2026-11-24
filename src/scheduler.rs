@@ -491,8 +491,10 @@ fn encoded_permalink_json_url(permalink: &str, base: &str) -> Option<String> {
     ))
 }
 
-/// Keep the previously working gallery JSON endpoint first. Newer routes are
-/// fallbacks only, so the original configured Reddit host gets the first chance.
+/// Build Reddit JSON routes for a submission. Prefer the documented by_id
+/// listing endpoint, which avoids the /comments path currently blocked by the
+/// hosting network; retain the previously working comments route and encoded
+/// permalink variants as fallbacks.
 fn gallery_metadata_urls(
     permalink: &str,
     id: &str,
@@ -501,27 +503,63 @@ fn gallery_metadata_urls(
 ) -> Vec<(String, &'static str)> {
     let primary = primary_base.trim_end_matches('/');
     let alternate = alternate_base.trim_end_matches('/');
-    let mut urls = vec![(
+    let mut urls = Vec::new();
+
+    let mut push_unique = |url: String, route: &'static str| {
+        if !urls.iter().any(|(existing, _)| existing == &url) {
+            urls.push((url, route));
+        }
+    };
+
+    if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        push_unique(
+            format!("{primary}/by_id/t3_{id}.json?raw_json=1"),
+            "by_id_primary",
+        );
+        push_unique(
+            format!("{alternate}/by_id/t3_{id}.json?raw_json=1"),
+            "by_id_alternate",
+        );
+    }
+
+    // Preserve the original route that worked in the uploaded older version.
+    push_unique(
         format!("{primary}/comments/{id}.json?raw_json=1"),
         "legacy_comments_primary",
-    )];
+    );
 
     for (base, route) in [
         (primary, "encoded_permalink_primary"),
         (alternate, "encoded_permalink_alternate"),
     ] {
         if let Some(url) = encoded_permalink_json_url(permalink, base) {
-            if !urls.iter().any(|(existing, _)| existing == &url) {
-                urls.push((url, route));
-            }
+            push_unique(url, route);
         }
     }
 
-    let alternate_legacy = format!("{alternate}/comments/{id}.json?raw_json=1");
-    if !urls.iter().any(|(existing, _)| existing == &alternate_legacy) {
-        urls.push((alternate_legacy, "legacy_comments_alternate"));
-    }
+    push_unique(
+        format!("{alternate}/comments/{id}.json?raw_json=1"),
+        "legacy_comments_alternate",
+    );
     urls
+}
+
+/// Compact classification for failed JSON page navigations. The browser layer
+/// returns document text rather than HTTP metadata, so this helps distinguish a
+/// JSON document from an HTML challenge or a rate-limit page in runtime logs.
+fn gallery_response_kind(body: &str) -> &'static str {
+    if is_reddit_network_security_block(body) {
+        "network_security_block"
+    } else if body.to_ascii_lowercase().contains("too many requests") {
+        "rate_limited"
+    } else {
+        match body.trim_start().chars().next() {
+            Some('[') | Some('{') => "json_document",
+            Some('<') => "html_document",
+            Some(_) => "text_document",
+            None => "empty_document",
+        }
+    }
 }
 
 pub struct Scheduler {
@@ -787,22 +825,55 @@ impl Scheduler {
                 }
             };
 
-            if is_reddit_network_security_block(&body) {
+            let response_kind = gallery_response_kind(&body);
+            if response_kind == "network_security_block" {
                 network_security_blocks += 1;
-                last_error = Some(anyhow::anyhow!("Reddit returned an explicit network-security block page for gallery metadata"));
+                warn!(
+                    post = %p.id,
+                    route = *route,
+                    response_kind,
+                    response_bytes = body.len(),
+                    "Reddit blocked gallery metadata route"
+                );
+                last_error = Some(anyhow::anyhow!("Reddit returned an explicit network-security block page for gallery metadata ({route})"));
                 continue;
             }
 
-            if body.to_ascii_lowercase().contains("too many requests") {
-                last_error = Some(anyhow::anyhow!("Reddit rate-limited the gallery metadata request"));
+            if response_kind == "rate_limited" {
+                warn!(
+                    post = %p.id,
+                    route = *route,
+                    response_kind,
+                    response_bytes = body.len(),
+                    "Reddit rate-limited gallery metadata route"
+                );
+                last_error = Some(anyhow::anyhow!("Reddit rate-limited gallery metadata request ({route})"));
                 break;
             }
 
             match parse_gallery(&body) {
-                Ok(items) => return self.deliverer.deliver_gallery(chat, p, &items, start_index, progress).await,
+                Ok(items) => {
+                    info!(
+                        post = %p.id,
+                        route = *route,
+                        items = items.len(),
+                        response_kind,
+                        "gallery metadata parsed"
+                    );
+                    return self.deliverer.deliver_gallery(chat, p, &items, start_index, progress).await;
+                }
                 Err(e) => {
-                    let prefix = body.trim().chars().take(120).collect::<String>().replace('\n', " ");
-                    last_error = Some(anyhow::anyhow!("{e:#}; response prefix: {prefix:?}"));
+                    let prefix = body.trim().chars().take(160).collect::<String>().replace('\n', " ");
+                    warn!(
+                        post = %p.id,
+                        route = *route,
+                        response_kind,
+                        response_bytes = body.len(),
+                        preview = %prefix,
+                        reason = %e,
+                        "gallery metadata response was not usable"
+                    );
+                    last_error = Some(anyhow::anyhow!("{e:#}; response kind: {response_kind}; response prefix: {prefix:?}"));
                 }
             }
         }
@@ -1232,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn original_gallery_json_route_is_first_and_fallbacks_are_retained() {
+    fn gallery_by_id_route_is_first_and_original_routes_remain_fallbacks() {
         let urls = gallery_metadata_urls(
             "https://www.reddit.com/r/MoeDesktop/comments/1y42nx5/my_custom_mogeko_castle_pack/",
             "1y42nx5",
@@ -1242,14 +1313,37 @@ mod tests {
         assert_eq!(
             urls[0],
             (
+                "https://old.reddit.com/by_id/t3_1y42nx5.json?raw_json=1".to_string(),
+                "by_id_primary",
+            )
+        );
+        assert_eq!(
+            urls[1],
+            (
+                "https://www.reddit.com/by_id/t3_1y42nx5.json?raw_json=1".to_string(),
+                "by_id_alternate",
+            )
+        );
+        assert_eq!(
+            urls[2],
+            (
                 "https://old.reddit.com/comments/1y42nx5.json?raw_json=1".to_string(),
                 "legacy_comments_primary",
             )
         );
-        assert_eq!(urls.len(), 4);
-        assert_eq!(urls[1].1, "encoded_permalink_primary");
-        assert_eq!(urls[2].1, "encoded_permalink_alternate");
-        assert_eq!(urls[3].1, "legacy_comments_alternate");
+        assert_eq!(urls.len(), 6);
+        assert_eq!(urls[3].1, "encoded_permalink_primary");
+        assert_eq!(urls[4].1, "encoded_permalink_alternate");
+        assert_eq!(urls[5].1, "legacy_comments_alternate");
+    }
+
+    #[test]
+    fn gallery_response_kind_distinguishes_json_html_blocks_and_rate_limits() {
+        assert_eq!(gallery_response_kind(r#"[{"data":{"children":[]}}]"#), "json_document");
+        assert_eq!(gallery_response_kind("<html><title>Blocked</title></html>"), "html_document");
+        assert_eq!(gallery_response_kind("You've been blocked by network security"), "network_security_block");
+        assert_eq!(gallery_response_kind("Too Many Requests"), "rate_limited");
+        assert_eq!(gallery_response_kind(""), "empty_document");
     }
 
     #[test]
