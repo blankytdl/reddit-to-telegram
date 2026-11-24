@@ -149,9 +149,9 @@ impl Telegram {
             "chat_id": chat, "text": html, "parse_mode": "HTML", "disable_web_page_preview": false
         });
         let (url, body) = (&url, &body);
-        self.retry(move || async move {
+        self.retry(self.operation_timeout.min(Duration::from_secs(30)), move || async move {
             Self::parse(self.client.post(url).json(body).timeout(self.operation_timeout.min(Duration::from_secs(30))).send().await).await
-        }, self.operation_timeout.min(Duration::from_secs(30)))
+        })
         .await
     }
 
