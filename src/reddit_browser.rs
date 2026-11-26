@@ -27,7 +27,14 @@ pub const EXTRACT_JS: &str = r#"(() => {
     const nsfw = el.classList.contains('over18')
       || el.classList.contains('nsfw')
       || el.getAttribute('data-nsfw') === 'true';
+    let created = Math.floor(Number(el.getAttribute('data-timestamp'))) || 0;
+    if (!created) {
+      const t = el.querySelector('time[datetime]');
+      const parsed = t ? Date.parse(t.getAttribute('datetime') || '') : NaN;
+      created = Number.isFinite(parsed) ? parsed : 0;
+    }
     posts.push({
+      created_ms: created,
       subreddit: el.getAttribute('data-subreddit') || '',
       spoiler: spoiler,
       nsfw: nsfw,
@@ -40,8 +47,14 @@ pub const EXTRACT_JS: &str = r#"(() => {
       promoted: el.classList.contains('promoted') || el.getAttribute('data-promoted') === 'true'
     });
   });
+  let after = '';
+  const nextLink = document.querySelector('.nav-buttons .next-button a, span.next-button a');
+  if (nextLink) {
+    const m = /[?&]after=([^&#]+)/.exec(nextLink.getAttribute('href') || '');
+    if (m) { try { after = decodeURIComponent(m[1]); } catch (_) { after = m[1]; } }
+  }
   const body = (document.body && document.body.textContent) || '';
-  return JSON.stringify({ title: document.title || '', url: location.href || '', text: body.slice(0, 400), posts: posts });
+  return JSON.stringify({ title: document.title || '', url: location.href || '', text: body.slice(0, 400), after: after, posts: posts });
 })()"#;
 
 /// Returns the raw page text (used to read a post's JSON document in the browser).
@@ -192,9 +205,24 @@ pub const GALLERY_JS: &str = r#"(() => {
       }
     }
 
+    // old.reddit post pages render galleries as plain tiles (no custom elements).
+    let oldRedditCount = 0;
+    if (out.length === 0) {
+      const tiles = deepAll(document, '.gallery-preview a[href], .gallery-tile a[href], a.gallery-item-thumbnail-link[href], .gallery-preview img, .gallery-tile img');
+      for (const node of tiles) {
+        const raw = node.getAttribute('href') || node.currentSrc || node.getAttribute('data-lazy-src') || node.getAttribute('src') || '';
+        const url = cleanImage(raw);
+        if (allowedImage(url)) {
+          oldRedditCount++;
+          add(url, /\.gif(?:[?#]|$)/i.test(url) ? 'animation' : 'photo');
+        }
+      }
+    }
+
     return {
       items: out,
       diagnostics: {
+        oldRedditCount,
         pageUrl: location.href || '',
         postCount: posts.length,
         galleryPostFound: !!post,
@@ -312,6 +340,7 @@ impl Browser {
                 .arg("--port")
                 .arg(self.s.port.to_string())
                 .args(&self.s.extra_args)
+                .env("LIGHTPANDA_DISABLE_TELEMETRY", "true")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())

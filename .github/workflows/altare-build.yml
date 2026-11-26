@@ -1,0 +1,31 @@
+name: Altare build
+
+# Builds the release binary inside Debian 12 (bookworm) so it also runs on panel hosts with an
+# older glibc than ubuntu-latest. Run manually, then download the artifact and upload it to the server.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: rust:1.88-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: cargo test --locked
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/reddit-telegram-bot dist/
+          cp .env.example dist/.env.example
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reddit-telegram-bot-linux-x86_64
+          path: dist/

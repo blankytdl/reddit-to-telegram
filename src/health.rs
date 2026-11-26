@@ -65,7 +65,14 @@ async fn handler(State(h): State<Arc<Health>>) -> (StatusCode, Json<Value>) {
 
 pub async fn serve(port: u16, health: Arc<Health>, token: CancellationToken) -> anyhow::Result<()> {
     let app = Router::new().route("/health", get(handler)).route("/", get(|| async { "ok" })).with_state(health);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Not fatal: the bot works without its health endpoint (e.g. a port the panel did not allocate).
+            tracing::warn!(port, "health server could not bind ({e}); continuing without it (set PORT/SERVER_PORT or HEALTH_ENABLED=false)");
+            return Ok(());
+        }
+    };
     tracing::info!(port, "health server listening");
     axum::serve(listener, app).with_graceful_shutdown(async move { token.cancelled().await }).await?;
     Ok(())

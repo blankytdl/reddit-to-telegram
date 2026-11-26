@@ -37,6 +37,16 @@ impl FileKind {
     }
 }
 
+/// Optional metadata for videos/animations. Without width/height/duration Telegram often shows
+/// stretched or length-less videos; the thumbnail gives a proper preview frame.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileExtras<'a> {
+    pub width: u64,
+    pub height: u64,
+    pub duration: u64,
+    pub thumb: Option<&'a Path>,
+}
+
 /// code 0 = network error (retryable), 1 = local error, otherwise Telegram/HTTP code.
 #[derive(Debug)]
 pub struct TgError {
@@ -160,7 +170,7 @@ impl Telegram {
         result
     }
 
-    async fn upload_once(&self, url: &str, chat: &str, kind: FileKind, path: &Path, caption: &str, spoiler: bool) -> Result<(), TgError> {
+    async fn upload_once(&self, url: &str, chat: &str, kind: FileKind, path: &Path, caption: &str, spoiler: bool, extras: &FileExtras<'_>) -> Result<(), TgError> {
         let part = file_part(path).await?;
         let mut form = Form::new()
             .text("chat_id", chat.to_string())
@@ -168,6 +178,21 @@ impl Telegram {
             .text("parse_mode", "HTML");
         if kind == FileKind::Video {
             form = form.text("supports_streaming", "true");
+        }
+        if matches!(kind, FileKind::Video | FileKind::Animation) {
+            if extras.width > 0 && extras.height > 0 {
+                form = form
+                    .text("width", extras.width.to_string())
+                    .text("height", extras.height.to_string());
+            }
+            if extras.duration > 0 {
+                form = form.text("duration", extras.duration.to_string());
+            }
+            if let Some(thumb) = extras.thumb {
+                form = form
+                    .part("thumb0", file_part(thumb).await?)
+                    .text("thumbnail", "attach://thumb0");
+            }
         }
         if spoiler && kind != FileKind::Document {
             form = form.text("has_spoiler", "true");
@@ -177,10 +202,14 @@ impl Telegram {
     }
 
     pub async fn send_file(&self, chat: &str, kind: FileKind, path: &Path, caption: &str, spoiler: bool) -> Result<(), TgError> {
+        self.send_file_with(chat, kind, path, caption, spoiler, &FileExtras::default()).await
+    }
+
+    pub async fn send_file_with(&self, chat: &str, kind: FileKind, path: &Path, caption: &str, spoiler: bool, extras: &FileExtras<'_>) -> Result<(), TgError> {
         let url = self.url(kind.method());
         let url = &url;
         let started = Instant::now();
-        let result = self.retry(self.operation_timeout, move || self.upload_once(url, chat, kind, path, caption, spoiler)).await;
+        let result = self.retry(self.operation_timeout, move || self.upload_once(url, chat, kind, path, caption, spoiler, extras)).await;
         match &result {
             Ok(()) => info!(kind = ?kind, elapsed_ms = started.elapsed().as_millis(), "Telegram media upload delivered"),
             Err(e) => warn!(kind = ?kind, code = e.code, elapsed_ms = started.elapsed().as_millis(), reason = %e, "Telegram media upload failed"),

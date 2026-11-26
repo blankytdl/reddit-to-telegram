@@ -1,14 +1,15 @@
 use crate::{
+    catchup,
     config::{CaptionOpts, Config, Group, Sort, SpoilerMode},
     health::Health,
     media_downloader as md,
     reddit_browser::Browser,
     reddit_parser::{
-        parse_gallery, parse_gallery_dom, parse_page, GalleryItem, GalleryKind, Media, PageStatus,
-        Post,
+        media_from_post_json, parse_gallery, parse_gallery_dom, parse_listing, GalleryItem,
+        GalleryKind, Media, PageStatus, Post,
     },
-    seen_store::{PendingDelivery, SeenStore},
-    telegram::{FileKind, Telegram, TgError},
+    seen_store::{Checkpoint, PendingDelivery, SeenStore},
+    telegram::{FileExtras, FileKind, Telegram, TgError},
 };
 use anyhow::{bail, Result};
 use reqwest::Client;
@@ -121,6 +122,27 @@ fn retry_as_document(e: &TgError, kind: FileKind) -> bool {
     !["chat", "rights", "forbidden", "caption", "blocked", "kicked", "entities", "parse"].iter().any(|w| d.contains(w))
 }
 
+/// Errors that retrying cannot fix (dead link, wrong content, file too large).
+fn is_permanent_item_error(e: &anyhow::Error) -> bool {
+    if md::is_too_large(e) {
+        return true;
+    }
+    let m = e.to_string().to_ascii_lowercase();
+    (m.contains("http 4") && !m.contains("http 429") && !m.contains("http 408"))
+        || m.contains("instead of media")
+        || m.contains("could not be resized")
+}
+
+/// `https://v.redd.it/<id>/...` -> `<id>`
+fn vreddit_id(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://v.redd.it/")?;
+    let id = rest.split(['/', '?', '#']).next()?;
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(id.to_string())
+}
+
 // ---------- delivery ----------
 
 fn is_reddit_network_security_block(body: &str) -> bool {
@@ -182,6 +204,11 @@ impl Deliverer {
         self.tg.send_file(chat, kind, path, cap, spoiler).await
     }
 
+    async fn file_with(&self, chat: &str, kind: FileKind, path: &Path, cap: &str, spoiler: bool, extras: &FileExtras<'_>) -> Result<(), TgError> {
+        self.pace(chat).await;
+        self.tg.send_file_with(chat, kind, path, cap, spoiler, extras).await
+    }
+
     pub async fn deliver(&self, chat: &str, p: &Post, media_only: bool) -> Result<()> {
         let spoiler = p.spoiler && self.cfg.spoiler_mode == SpoilerMode::Mark;
         let c = Ctx { chat, p, cap: caption(p, spoiler, self.cfg.caption), spoiler, media_only };
@@ -208,6 +235,19 @@ impl Deliverer {
             .ok_or_else(|| anyhow::anyhow!("gallery image too large and could not be resized"))?;
         let resized_size = resized.size().await;
         Ok((resized, resized_size))
+    }
+
+    /// Downloads one gallery photo, retrying transient failures once.
+    async fn fetch_photo_retry(&self, post_id: &str, url: &str) -> Result<(md::TempFile, u64)> {
+        match self.fetch_photo(post_id, url).await {
+            Ok(v) => Ok(v),
+            Err(e) if is_permanent_item_error(&e) => Err(e),
+            Err(e) => {
+                warn!(post = %post_id, reason = %e, "gallery photo download failed; retrying once");
+                sleep(Duration::from_secs(2)).await;
+                self.fetch_photo(post_id, url).await
+            }
+        }
     }
 
     /// Returns how many leading photos were confirmed sent, so a failed gallery
@@ -255,6 +295,8 @@ impl Deliverer {
         let mut index = start_index.min(items.len());
         progress.store(index, Ordering::Relaxed);
         let mut cap_used = index > 0;
+        let mut sent_any = index > 0;
+        let mut skipped = 0usize;
 
         while index < items.len() {
             if items[index].kind == GalleryKind::Photo {
@@ -264,21 +306,37 @@ impl Deliverer {
                     end += 1;
                 }
 
+                // One dead image must not sink the whole gallery: permanent per-image failures
+                // are skipped, transient ones fail the post so it is retried as a whole.
                 let mut files = Vec::with_capacity(end - start);
-                for item in &items[start..end] {
-                    match self.fetch_photo(&p.id, &item.url).await {
-                        Ok(file) => files.push(file),
+                let mut kept: Vec<usize> = Vec::with_capacity(end - start);
+                for (offset, item) in items[start..end].iter().enumerate() {
+                    match self.fetch_photo_retry(&p.id, &item.url).await {
+                        Ok(file) => {
+                            files.push(file);
+                            kept.push(start + offset);
+                        }
+                        Err(e) if is_permanent_item_error(&e) => {
+                            warn!(post = %p.id, item = start + offset, reason = %e, "gallery photo skipped");
+                            skipped += 1;
+                        }
                         Err(e) => return (start, Err(e)),
                     }
+                }
+                if files.is_empty() {
+                    index = end;
+                    progress.store(index, Ordering::Relaxed);
+                    continue;
                 }
 
                 let chunk_cap = if cap_used { "" } else { cap.as_str() };
                 let (sent, result) = self.send_album(&c, &files, chunk_cap).await;
                 if let Err(e) = result {
-                    index = start + sent;
+                    index = kept.get(sent).copied().unwrap_or(end);
                     progress.store(index, Ordering::Relaxed);
                     return (index, Err(e));
                 }
+                sent_any = true;
                 index = end;
                 progress.store(index, Ordering::Relaxed);
                 cap_used = true;
@@ -296,19 +354,44 @@ impl Deliverer {
             };
             let result = match item.kind {
                 GalleryKind::Animation => self.media(&item_ctx, &item.url, FileKind::Animation).await,
-                GalleryKind::Video => self.media(&item_ctx, &item.url, FileKind::Video).await,
+                GalleryKind::Video => self.gallery_video(&item_ctx, &item.url).await,
                 GalleryKind::DashVideo => self.gallery_video_manifest(&item_ctx, &item.url).await,
                 GalleryKind::Photo => unreachable!("photo items are sent in albums"),
             };
-            if let Err(e) = result {
-                return (item_index, Err(e));
+            match result {
+                Ok(()) => {
+                    sent_any = true;
+                    cap_used = true;
+                }
+                Err(e) if is_permanent_item_error(&e) => {
+                    warn!(post = %p.id, item = item_index, reason = %e, "gallery item skipped");
+                    skipped += 1;
+                }
+                Err(e) => return (item_index, Err(e)),
             }
             index += 1;
             progress.store(index, Ordering::Relaxed);
-            cap_used = true;
         }
 
+        if !sent_any {
+            return (index, Err(anyhow::anyhow!("gallery had no deliverable media ({skipped} items skipped)")));
+        }
+        if skipped > 0 {
+            warn!(post = %p.id, skipped, "gallery delivered with some items skipped");
+        }
         (index, Ok(()))
+    }
+
+    /// Gallery videos that live on v.redd.it get the same audio+video handling as normal videos
+    /// (the direct DASH_* file is silent); anything else is downloaded as a plain file.
+    async fn gallery_video(&self, c: &Ctx<'_>, url: &str) -> Result<()> {
+        if let Some(id) = vreddit_id(url) {
+            match self.reddit_video(c, &id).await {
+                Ok(()) => return Ok(()),
+                Err(e) => warn!(post = %c.p.id, reason = %e, "gallery video with audio failed; trying the direct file"),
+            }
+        }
+        self.media(c, url, FileKind::Video).await
     }
 
     async fn gallery_video_manifest(&self, c: &Ctx<'_>, url: &str) -> Result<()> {
@@ -388,14 +471,54 @@ impl Deliverer {
     }
 
     async fn upload(&self, c: &Ctx<'_>, path: &Path, size: u64, kind: FileKind) -> Result<()> {
-        if kind == FileKind::Photo {
-            return self.upload_photo(c, path, size).await;
+        match kind {
+            FileKind::Photo => return self.upload_photo(c, path, size).await,
+            FileKind::Video => return self.upload_video(c, path).await,
+            _ => {}
         }
         match self.file(c.chat, kind, path, &c.cap, c.spoiler).await {
             Ok(()) => Ok(()),
             Err(e) if retry_as_document(&e, kind) => {
                 warn!("telegram rejected {:?} ({}); retrying as document", kind, e.desc);
                 self.file(c.chat, FileKind::Document, path, &c.cap, false).await?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Videos are re-indexed (moov atom first, stream copy only), probed for size/length and given
+    /// a preview frame so Telegram shows them with the right aspect ratio, duration and thumbnail.
+    /// Every helper step is best effort: if ffmpeg/ffprobe are missing the plain file is sent.
+    async fn upload_video(&self, c: &Ctx<'_>, path: &Path) -> Result<()> {
+        let fast = match md::faststart(&self.cfg.ffmpeg_bin, path).await {
+            Ok(t) => Some(t),
+            Err(e) => {
+                debug!(post = %c.p.id, reason = %e, "faststart remux skipped");
+                None
+            }
+        };
+        let send_path: &Path = fast.as_ref().map(|t| t.path()).unwrap_or(path);
+        let info = md::probe_video(&self.cfg.ffprobe_bin, send_path).await.ok();
+        let thumb = match &info {
+            Some(i) if i.has_video => md::make_thumbnail(&self.cfg.ffmpeg_bin, send_path, i.duration).await.ok(),
+            _ => None,
+        };
+        let silent_clip = info
+            .as_ref()
+            .is_some_and(|i| i.has_video && !i.has_audio && i.duration > 0 && i.duration <= 60);
+        let kind = if silent_clip && self.cfg.silent_as_animation { FileKind::Animation } else { FileKind::Video };
+        let extras = FileExtras {
+            width: info.as_ref().map_or(0, |i| i.width),
+            height: info.as_ref().map_or(0, |i| i.height),
+            duration: info.as_ref().map_or(0, |i| i.duration),
+            thumb: thumb.as_ref().map(|t| t.path()),
+        };
+        match self.file_with(c.chat, kind, send_path, &c.cap, c.spoiler, &extras).await {
+            Ok(()) => Ok(()),
+            Err(e) if retry_as_document(&e, kind) => {
+                warn!(post = %c.p.id, "telegram rejected {:?} ({}); retrying as document", kind, e.desc);
+                self.file(c.chat, FileKind::Document, send_path, &c.cap, false).await?;
                 Ok(())
             }
             Err(e) => Err(e.into()),
@@ -441,7 +564,7 @@ impl Deliverer {
                 let size = tf.size().await;
                 if size > self.cfg.max_upload_bytes {
                     warn!(post = %c.p.id, size, "video exceeds Telegram upload limit; skipping media");
-                    bail!("video exceeds Telegram upload limit");
+                    return Err(md::TooLarge(size).into());
                 }
                 self.upload(c, tf.path(), size, FileKind::Video).await
             }
@@ -589,7 +712,12 @@ impl Scheduler {
             // On SIGTERM give the cycle 20 s to wrap up (Render kills after ~30 s), then
             // abandon it so the final state flush still happens.
             let tok = self.token.clone();
-            let hard = self.cfg.cycle_budget + self.cfg.post_delivery_timeout + Duration::from_secs(30);
+            // One in-flight post may overrun the budget by its own deadline (galleries also get a
+            // lookup phase), so leave generous room before the cycle is abandoned.
+            let hard = self.cfg.cycle_budget
+                + self.cfg.post_delivery_timeout * 2
+                + self.cfg.gallery_resolve_timeout
+                + Duration::from_secs(300);
             let outcome = tokio::select! {
                 r = timeout(hard, self.cycle()) => Some(r),
                 _ = async { tok.cancelled().await; sleep(Duration::from_secs(20)).await; } => None,
@@ -612,7 +740,15 @@ impl Scheduler {
                 info!("recycling browser");
                 self.browser.shutdown().await;
             }
+            let removed = md::cleanup_temp(Duration::from_secs(30 * 60));
+            if removed > 0 {
+                info!(removed, "removed stale temporary media files");
+            }
             let wait = self.cfg.interval.saturating_sub(started.elapsed()).max(Duration::from_secs(30)) + self.penalty;
+            // Free the browser's memory between polls on small hosts (it restarts in about a second).
+            if self.cfg.browser_idle_shutdown && wait >= Duration::from_secs(120) {
+                self.browser.shutdown().await;
+            }
             self.health.set_stage("idle until next poll", wait.as_secs());
             info!(next_in_secs = wait.as_secs(), "cycle finished");
             // Keep the host console visibly alive during the poll interval.
@@ -704,7 +840,7 @@ impl Scheduler {
         // Fresh feeds always have priority. Retry at most one old failure only
         // after subreddit polling, and only when there is remaining cycle budget.
         if !self.token.is_cancelled() && started.elapsed() < cfg.cycle_budget {
-            self.retry_pending().await;
+            self.retry_pending(started).await;
         } else if !self.store.pending_due(unix_now(), 1).is_empty() {
             info!("pending delivery retry deferred to a later poll to protect fresh-feed polling");
         }
@@ -717,7 +853,9 @@ impl Scheduler {
     }
 
     /// Fetch each subreddit separately so a busy subreddit cannot consume another
-    /// subreddit's configured post limit.
+    /// subreddit's configured post limit. A /new feed that was already running is paged back
+    /// until it reaches posts we have already handled, which catches everything that was
+    /// missed since the last poll (the "last log"): downtime, rate limits, busy subreddits.
     async fn fetch_group(&mut self, g: &Group) -> Result<Option<Vec<Post>>> {
         let mut all = Vec::new();
         for (index, (name, limit)) in g.names.iter().zip(&g.limits).enumerate() {
@@ -727,7 +865,25 @@ impl Scheduler {
             if index > 0 {
                 sleep(self.cfg.request_gap).await;
             }
-            let mut posts = match self.fetch_listing(std::slice::from_ref(name), g.sort, *limit).await? {
+
+            let key = sub_key(&g.chat_id, name, g.sort);
+            let initialized = self.store.sub_known(&g.chat_id, name, g.sort.path());
+            let paging = initialized && g.sort == Sort::New && self.cfg.catchup_max_pages > 1;
+            let checkpoint = self.store.checkpoint(&key);
+            let now = unix_now();
+            let floor_ms = catchup::catchup_floor_ms(
+                checkpoint.as_ref().map_or(0, |c| c.newest_ms),
+                now.saturating_mul(1000),
+                self.cfg.catchup_max_age.as_millis() as u64,
+            );
+            if let Some(cp) = &checkpoint {
+                let idle = now.saturating_sub(cp.polled_unix);
+                if paging && cp.polled_unix > 0 && idle > self.cfg.interval.as_secs() * 2 {
+                    info!(sub = %name, idle_mins = idle / 60, "last successful poll was a while ago; catching up on missed posts");
+                }
+            }
+
+            let mut posts = match self.fetch_stream(&g.chat_id, name, g.sort, *limit, paging, floor_ms).await? {
                 Some(posts) => posts,
                 None => return Ok(None),
             };
@@ -743,21 +899,109 @@ impl Scheduler {
         Ok(Some(all))
     }
 
-    /// Ok(None) = rate limited / blocked even after backoff.
-    async fn fetch_listing(&mut self, names: &[String], sort: Sort, limit: usize) -> Result<Option<Vec<Post>>> {
-        let url = format!("{}/r/{}/{}/?limit={}", self.cfg.reddit_base, names.join("+"), sort.path(), limit);
+    /// Fetches one subreddit stream. With `paging`, keeps following the listing's `after`
+    /// cursor until a page ends in already-known posts, reaches posts older than `floor_ms`,
+    /// has no further page, or the page cap is hit. Ok(None) = rate limited / blocked.
+    async fn fetch_stream(
+        &mut self,
+        chat: &str,
+        name: &str,
+        sort: Sort,
+        limit: usize,
+        paging: bool,
+        floor_ms: u64,
+    ) -> Result<Option<Vec<Post>>> {
+        let max_pages = if paging { self.cfg.catchup_max_pages } else { 1 };
+        let mut all: Vec<Post> = Vec::new();
+        let mut after: Option<String> = None;
+        let mut window_exhausted = false;
+
+        for page in 1..=max_pages {
+            if page > 1 {
+                if self.token.is_cancelled() {
+                    break;
+                }
+                sleep(self.cfg.request_gap).await;
+            }
+            let fetched = match self.fetch_page(name, sort, limit, after.as_deref()).await {
+                Ok(Some(v)) => v,
+                Ok(None) if page == 1 => return Ok(None),
+                Err(e) if page == 1 => return Err(e),
+                Ok(None) => {
+                    warn!(sub = %name, page, "catch-up paging stopped (rate limited); the rest is picked up next poll");
+                    break;
+                }
+                Err(e) => {
+                    warn!(sub = %name, page, "catch-up paging stopped: {e:#}");
+                    break;
+                }
+            };
+            let (mut posts, next) = fetched;
+
+            let known: Vec<bool> = posts.iter().map(|p| self.is_known(chat, &p.id)).collect();
+            let oldest_ms = posts.iter().map(|p| p.created_ms).filter(|ms| *ms > 0).min();
+            let anchored = catchup::reached_anchor(&known, catchup::ANCHOR_STREAK);
+            let too_old = floor_ms > 0 && oldest_ms.is_some_and(|ms| ms < floor_ms);
+            all.append(&mut posts);
+            if page > 1 {
+                info!(sub = %name, page, total = all.len(), "catch-up page fetched");
+            }
+
+            match next {
+                Some(cursor) if paging && !anchored && !too_old => {
+                    if page == max_pages {
+                        window_exhausted = true;
+                    } else {
+                        after = Some(cursor);
+                    }
+                }
+                _ => break,
+            }
+        }
+        if window_exhausted {
+            warn!(
+                sub = %name,
+                pages = max_pages,
+                "catch-up window exhausted before reaching already-seen posts; older posts are skipped (raise CATCHUP_MAX_PAGES to reach further back)"
+            );
+        }
+        Ok(Some(all))
+    }
+
+    /// One listing page. Ok(None) = rate limited / blocked even after backoff.
+    async fn fetch_page(&mut self, name: &str, sort: Sort, limit: usize, after: Option<&str>) -> Result<Option<(Vec<Post>, Option<String>)>> {
+        let mut url = format!("{}/r/{}/{}/?limit={}", self.cfg.reddit_base, name, sort.path(), limit);
+        if let Some(cursor) = after {
+            url.push_str(&format!("&count={limit}&after={cursor}"));
+        }
         let mut delay = Duration::from_secs(30);
-        for attempt in 1..=3 {
-            self.health.set_stage(&format!("Reddit fetch r/{} attempt {attempt}", names.join("+")), 0);
-            let json = self.browser.fetch(&url).await?;
-            match parse_page(&json, limit)? {
-                PageStatus::Ok(p) => return Ok(Some(p)),
-                PageStatus::Blocked(r) => {
+        let mut browser_retry = true;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            self.health.set_stage(&format!("Reddit fetch r/{name} attempt {attempt}"), 0);
+            let json = match self.browser.fetch(&url).await {
+                Ok(json) => json,
+                // One quick retry with a fresh browser: a transient page failure should not cost a whole poll.
+                Err(e) if browser_retry => {
+                    browser_retry = false;
+                    warn!(sub = %name, reason = %e, "page load failed; retrying once");
+                    sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match parse_listing(&json, limit)? {
+                (PageStatus::Ok(posts), next) => return Ok(Some((posts, next))),
+                (PageStatus::Blocked(reason), _) => {
                     // No bypass attempt: treat like a rate limit and back off the whole cycle.
-                    warn!(reason = %r, "Reddit served a block/CAPTCHA/login page; backing off");
+                    warn!(reason = %reason, "Reddit served a block/CAPTCHA/login page; backing off");
                     return Ok(None);
                 }
-                PageStatus::RateLimited => {
+                (PageStatus::RateLimited, _) => {
+                    if attempt >= 3 {
+                        return Ok(None);
+                    }
                     warn!(attempt, wait_secs = delay.as_secs(), "rate limited by Reddit; backing off");
                     tokio::select! {
                         _ = self.token.cancelled() => return Ok(None),
@@ -767,57 +1011,45 @@ impl Scheduler {
                 }
             }
         }
-        Ok(None)
     }
 
-    /// Read gallery metadata from Reddit's JSON document. If the configured host
-    /// returns an HTML shell/error page, try the other canonical Reddit host.
-    async fn deliver_gallery_post(
-        &mut self,
-        chat: &str,
-        p: &Post,
-        id: &str,
-        media_only: bool,
-        start_index: usize,
-        progress: &AtomicUsize,
-    ) -> (usize, Result<()>) {
+    /// Reads a gallery's media list: Reddit's JSON views first (bounded to 60% of the lookup
+    /// budget), then the rendered HTML page (new-Reddit carousel and old-Reddit tiles) with
+    /// the rest of the budget. The HTML fallback runs after ANY JSON failure except a rate limit.
+    async fn resolve_gallery(&mut self, p: &Post, id: &str) -> Result<Vec<GalleryItem>> {
         sleep(self.cfg.request_gap).await;
+        let started = Instant::now();
+        let budget = self.cfg.gallery_resolve_timeout;
+        let json_budget = budget * 3 / 5;
 
-        let primary_base = self.cfg.reddit_base.trim_end_matches('/');
+        let primary_base = self.cfg.reddit_base.trim_end_matches('/').to_string();
         let alternate_base = if primary_base.contains("old.reddit.com") {
-            "https://www.reddit.com"
+            "https://www.reddit.com".to_string()
         } else {
-            "https://old.reddit.com"
+            "https://old.reddit.com".to_string()
         };
-        // Use the original comments JSON route first; encoded permalink routes
-        // are retained as fallbacks for hosts that block the original endpoint.
         let canonical_permalink = p.permalink
             .replace("http://old.reddit.com", "https://www.reddit.com")
             .replace("https://old.reddit.com", "https://www.reddit.com");
-        let urls = gallery_metadata_urls(
-            &canonical_permalink,
-            id,
-            primary_base,
-            alternate_base,
-        );
+        let urls = gallery_metadata_urls(&canonical_permalink, id, &primary_base, &alternate_base);
 
-        let mut last_error = None;
-        let mut network_security_blocks = 0usize;
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut rate_limited = false;
         for (index, (url, route)) in urls.iter().enumerate() {
+            let left = json_budget.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
             if index > 0 {
-                sleep(self.cfg.request_gap).await;
+                sleep(self.cfg.request_gap.min(left)).await;
+            }
+            let left = json_budget.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
             }
 
             info!(post = %p.id, attempt = index + 1, route = *route, "gallery metadata lookup started");
-            // The first route intentionally uses the general page timeout, as the
-            // original implementation did (90s by default). Faster bounded timeouts
-            // remain in place for the additional fallback routes.
-            let fetch = if index == 0 {
-                self.browser.fetch_text(url).await
-            } else {
-                self.browser.fetch_text_with_timeout(url, self.cfg.gallery_lookup_timeout).await
-            };
-            let body = match fetch {
+            let body = match self.browser.fetch_text_with_timeout(url, self.cfg.gallery_lookup_timeout.min(left)).await {
                 Ok(body) => body,
                 Err(e) => {
                     last_error = Some(e);
@@ -827,84 +1059,57 @@ impl Scheduler {
 
             let response_kind = gallery_response_kind(&body);
             if response_kind == "network_security_block" {
-                network_security_blocks += 1;
-                warn!(
-                    post = %p.id,
-                    route = *route,
-                    response_kind,
-                    response_bytes = body.len(),
-                    "Reddit blocked gallery metadata route"
-                );
+                warn!(post = %p.id, route = *route, response_kind, response_bytes = body.len(), "Reddit blocked gallery metadata route");
                 last_error = Some(anyhow::anyhow!("Reddit returned an explicit network-security block page for gallery metadata ({route})"));
                 continue;
             }
-
             if response_kind == "rate_limited" {
-                warn!(
-                    post = %p.id,
-                    route = *route,
-                    response_kind,
-                    response_bytes = body.len(),
-                    "Reddit rate-limited gallery metadata route"
-                );
+                warn!(post = %p.id, route = *route, response_kind, response_bytes = body.len(), "Reddit rate-limited gallery metadata route");
                 last_error = Some(anyhow::anyhow!("Reddit rate-limited gallery metadata request ({route})"));
+                rate_limited = true;
                 break;
             }
 
             match parse_gallery(&body) {
                 Ok(items) => {
-                    info!(
-                        post = %p.id,
-                        route = *route,
-                        items = items.len(),
-                        response_kind,
-                        "gallery metadata parsed"
-                    );
-                    return self.deliverer.deliver_gallery(chat, p, &items, start_index, progress).await;
+                    info!(post = %p.id, route = *route, items = items.len(), response_kind, "gallery metadata parsed");
+                    return Ok(items);
                 }
                 Err(e) => {
                     let prefix = body.trim().chars().take(160).collect::<String>().replace('\n', " ");
-                    warn!(
-                        post = %p.id,
-                        route = *route,
-                        response_kind,
-                        response_bytes = body.len(),
-                        preview = %prefix,
-                        reason = %e,
-                        "gallery metadata response was not usable"
-                    );
+                    warn!(post = %p.id, route = *route, response_kind, response_bytes = body.len(), preview = %prefix, reason = %e, "gallery metadata response was not usable");
                     last_error = Some(anyhow::anyhow!("{e:#}; response kind: {response_kind}; response prefix: {prefix:?}"));
                 }
             }
         }
 
-        // The JSON route can be denied while Reddit's ordinary HTML page remains
-        // available. In that case read the rendered carousel DOM instead of
-        // silently dropping the gallery or trying to disguise the blocked URL.
-        if network_security_blocks > 0 {
-            // Prefer the full canonical post permalink: the new Reddit post-detail
-            // view loads its gallery asynchronously through post_detail_gallery.
-            let permalink = p.permalink
-                .replace("https://old.reddit.com", "https://www.reddit.com")
-                .replace("http://old.reddit.com", "https://www.reddit.com");
+        if !rate_limited {
             let html_urls = [
-                permalink,
+                canonical_permalink.clone(),
                 format!("https://www.reddit.com/gallery/{id}"),
                 format!("https://old.reddit.com/comments/{id}/"),
             ];
             for (index, url) in html_urls.iter().enumerate() {
+                let left = budget.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    break;
+                }
                 if index > 0 {
-                    sleep(self.cfg.request_gap).await;
+                    sleep(self.cfg.request_gap.min(left)).await;
+                }
+                let left = budget.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    break;
                 }
                 info!(post = %p.id, attempt = index + 1, "gallery HTML fallback started");
-                match self.browser.fetch_gallery_with_timeout(url, self.cfg.gallery_lookup_timeout).await {
+                match self.browser.fetch_gallery_with_timeout(url, self.cfg.gallery_lookup_timeout.min(left)).await {
                     Ok(body) => match parse_gallery_dom(&body) {
                         Ok(items) => {
-                            info!(post = %p.id, items = items.len(), "gallery HTML carousel extracted");
-                            return self.deliverer.deliver_gallery(chat, p, &items, start_index, progress).await;
+                            info!(post = %p.id, items = items.len(), "gallery HTML extracted");
+                            return Ok(items);
                         }
                         Err(error) => {
-                            warn!(post = %p.id, reason = %error, "gallery HTML did not expose its carousel yet");
+                            warn!(post = %p.id, reason = %error, "gallery HTML did not expose its media");
                             last_error = Some(anyhow::anyhow!("HTML gallery extraction failed: {error:#}"));
                         }
                     },
@@ -914,17 +1119,81 @@ impl Scheduler {
                 }
             }
         }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Reddit returned no gallery metadata")))
+    }
 
-        let error = last_error.unwrap_or_else(|| anyhow::anyhow!("Reddit returned no gallery metadata"));
-        warn!(post = %p.id, media_only, reason = %error, "gallery media could not be resolved");
-
-        if media_only {
-            (start_index, Err(anyhow::anyhow!("gallery extraction failed; post remains unseen for retry: {error:#}")))
-        } else {
-            (start_index, self.deliverer
-                .deliver_link(chat, p, "Gallery media could not be loaded; open the original post.")
-                .await)
+    /// Resolves the gallery's media list, then delivers it. Lookup and delivery have separate
+    /// time budgets so a slow lookup cannot leave no time for the actual upload.
+    async fn deliver_gallery_post(
+        &mut self,
+        chat: &str,
+        p: &Post,
+        id: &str,
+        media_only: bool,
+        start_index: usize,
+        progress: &AtomicUsize,
+    ) -> (usize, Result<()>) {
+        let items = match self.resolve_gallery(p, id).await {
+            Ok(items) => items,
+            Err(error) => {
+                warn!(post = %p.id, media_only, reason = %error, "gallery media could not be resolved");
+                return if media_only {
+                    (start_index, Err(anyhow::anyhow!("gallery extraction failed; post stays queued for retry: {error:#}")))
+                } else {
+                    (start_index, self.deliverer.deliver_link(chat, p, "Gallery media could not be loaded; open the original post.").await)
+                };
+            }
+        };
+        let budget = (self.cfg.post_delivery_timeout + Duration::from_secs(10 * items.len() as u64)).min(Duration::from_secs(900));
+        match timeout(budget, self.deliverer.deliver_gallery(chat, p, &items, start_index, progress)).await {
+            Ok(result) => result,
+            Err(_) => (
+                progress.load(Ordering::Relaxed),
+                Err(anyhow::anyhow!("gallery delivery timed out after {}s", budget.as_secs())),
+            ),
         }
+    }
+
+    /// Delivers one post. Returns the resume index (galleries only) and the outcome.
+    async fn deliver_post(&mut self, chat: &str, p: &Post, media_only: bool, start_index: usize) -> (usize, Result<()>) {
+        let progress = AtomicUsize::new(start_index);
+        if let Media::Gallery(id) = &p.media {
+            return self.deliver_gallery_post(chat, p, id, media_only, start_index, &progress).await;
+        }
+        match timeout(self.cfg.post_delivery_timeout, self.deliverer.deliver(chat, p, media_only)).await {
+            Ok(result) => (start_index, result),
+            Err(_) => (
+                start_index,
+                Err(anyhow::anyhow!("post delivery timed out after {}s", self.cfg.post_delivery_timeout.as_secs())),
+            ),
+        }
+    }
+
+    /// A crosspost's listing URL points at the original post, so the real media (image, video,
+    /// gallery, link) has to be looked up. Without this, media-only feeds silently dropped them.
+    async fn resolve_crosspost(&mut self, p: &Post) -> Result<(Media, String)> {
+        if p.id.is_empty() || !p.id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            bail!("invalid post id for crosspost lookup");
+        }
+        let primary = self.cfg.reddit_base.trim_end_matches('/').to_string();
+        let alternate = if primary.contains("old.reddit.com") {
+            "https://www.reddit.com".to_string()
+        } else {
+            "https://old.reddit.com".to_string()
+        };
+        let mut last_error = anyhow::anyhow!("no crosspost lookup route succeeded");
+        for base in [primary, alternate].iter() {
+            sleep(self.cfg.request_gap).await;
+            let url = format!("{base}/by_id/t3_{}.json?raw_json=1", p.id);
+            match self.browser.fetch_text_with_timeout(&url, self.cfg.gallery_lookup_timeout).await {
+                Ok(body) => match media_from_post_json(&body) {
+                    Ok(found) => return Ok(found),
+                    Err(e) => last_error = e,
+                },
+                Err(e) => last_error = e,
+            }
+        }
+        Err(last_error)
     }
 
     /// Seen is tracked per destination channel (like the Python bot's `channel_seen`), so the same
@@ -933,17 +1202,54 @@ impl Scheduler {
         self.store.contains(id) || self.store.contains(&format!("{chat}|{id}"))
     }
 
+    /// Seen, or already queued for retry: either way the retry queue owns it.
+    fn is_known(&self, chat: &str, id: &str) -> bool {
+        self.is_seen(chat, id) || self.store.has_pending(chat, id)
+    }
+
     fn mark_seen(&mut self, chat: &str, id: &str) {
         self.store.insert(&format!("{chat}|{id}"));
     }
 
-    async fn retry_pending(&mut self) {
-        // Retry one old failure after fresh feeds have been checked, so a large
-        // retry queue cannot starve new subreddit polling.
-        const RETRY_BATCH: usize = 1;
-        let due = self.store.pending_due(unix_now(), RETRY_BATCH);
+    /// Text/self posts have nothing to forward in a media-only feed (NSFW posts and external
+    /// links are still kept, as before).
+    fn is_text_only_filtered(&self, p: &Post, media_only: bool) -> bool {
+        media_only && p.media == Media::None && p.source_url.is_empty() && !(p.nsfw && self.cfg.include_nsfw)
+    }
+
+    /// Queues a failed post for a backed-off retry, or gives up on it after too many attempts
+    /// (or at once for permanent failures such as files over Telegram's size limit), so one
+    /// undeliverable post can never clog the retry queue forever.
+    async fn record_failure(&mut self, chat: &str, post: &Post, media_only: bool, gallery_index: usize, attempts: u8, error: &anyhow::Error) {
+        let permanent = md::is_too_large(error);
+        if permanent || attempts >= self.cfg.max_delivery_attempts {
+            warn!(post = %post.id, attempts, permanent, reason = %error, "giving up on post; marked seen so it cannot block the queue");
+            self.mark_seen(chat, &post.id);
+            self.store.remove_pending(chat, &post.id);
+            self.store.flush().await;
+            return;
+        }
+        let delay = delivery_retry_delay(self.cfg.interval, attempts);
+        self.store.upsert_pending(PendingDelivery {
+            chat: chat.to_string(),
+            post: post.clone(),
+            media_only,
+            attempts,
+            retry_at_unix: unix_now().saturating_add(delay.as_secs()),
+            gallery_index,
+        });
+        // Persist failures immediately: a process restart must not erase
+        // the retry queue or a gallery's resume position.
+        self.store.flush().await;
+        warn!(post = %post.id, attempt = attempts, retry_in_secs = delay.as_secs(), reason = %error, "delivery failed; persisted retry queued");
+    }
+
+    async fn retry_pending(&mut self, cycle_started: Instant) {
+        // Fresh feeds are checked first; only a few old failures are retried per cycle so a
+        // large retry queue cannot starve new subreddit polling.
+        let due = self.store.pending_due(unix_now(), self.cfg.retry_batch);
         for mut item in due {
-            if self.token.is_cancelled() {
+            if self.token.is_cancelled() || cycle_started.elapsed() >= self.cfg.cycle_budget {
                 break;
             }
 
@@ -951,6 +1257,28 @@ impl Scheduler {
             let id = item.post.id.clone();
             if self.is_seen(&chat, &id) {
                 self.store.remove_pending(&chat, &id);
+                continue;
+            }
+            let next_attempt = item.attempts.saturating_add(1);
+
+            self.health.set_stage(&format!("retrying post {id}"), 0);
+            if item.post.crosspost && item.post.media == Media::None && item.post.source_url.is_empty() {
+                match self.resolve_crosspost(&item.post).await {
+                    Ok((media, source_url)) => {
+                        item.post.media = media;
+                        item.post.source_url = source_url;
+                    }
+                    Err(error) => {
+                        let post = item.post.clone();
+                        self.record_failure(&chat, &post, item.media_only, item.gallery_index, next_attempt, &error).await;
+                        continue;
+                    }
+                }
+            }
+            if self.is_text_only_filtered(&item.post, item.media_only) {
+                self.mark_seen(&chat, &id);
+                self.store.remove_pending(&chat, &id);
+                self.store.flush().await;
                 continue;
             }
 
@@ -966,24 +1294,8 @@ impl Scheduler {
                 continue;
             }
 
-            self.health.set_stage(&format!("retrying post {id}"), 0);
-            let progress = AtomicUsize::new(item.gallery_index);
-            let outcome = timeout(self.cfg.post_delivery_timeout, async {
-                match &item.post.media {
-                    Media::Gallery(gallery_id) => {
-                        self.deliver_gallery_post(&chat, &item.post, gallery_id, item.media_only, item.gallery_index, &progress).await
-                    }
-                    _ => (item.gallery_index, self.deliverer.deliver(&chat, &item.post, item.media_only).await),
-                }
-            }).await;
-            let (gallery_index, result) = match outcome {
-                Ok(result) => result,
-                Err(_) => (
-                    progress.load(Ordering::Relaxed),
-                    Err(anyhow::anyhow!("post delivery timed out after {}s", self.cfg.post_delivery_timeout.as_secs())),
-                ),
-            };
-
+            let post = item.post.clone();
+            let (gallery_index, result) = self.deliver_post(&chat, &post, item.media_only, item.gallery_index).await;
             match result {
                 Ok(()) => {
                     self.mark_seen(&chat, &id);
@@ -995,21 +1307,26 @@ impl Scheduler {
                     info!(post = %id, "persisted retry delivered");
                 }
                 Err(error) => {
-                    item.attempts = item.attempts.saturating_add(1);
-                    let delay = delivery_retry_delay(self.cfg.interval, item.attempts);
-                    item.retry_at_unix = unix_now().saturating_add(delay.as_secs());
-                    item.gallery_index = gallery_index;
-                    self.store.upsert_pending(item.clone());
-                    self.store.flush().await;
-                    warn!(
-                        post = %id,
-                        attempt = item.attempts,
-                        retry_in_secs = delay.as_secs(),
-                        reason = %error,
-                        "persisted retry failed; keeping it queued"
-                    );
+                    self.record_failure(&chat, &post, item.media_only, gallery_index, next_attempt, &error).await;
                 }
             }
+        }
+    }
+
+    /// Advances the per-stream checkpoints after a group was processed.
+    fn update_checkpoints(&mut self, g: &Group, snapshot: &[(String, u64, String)]) {
+        let now = unix_now();
+        for name in &g.names {
+            let lname = name.to_ascii_lowercase();
+            let rows: Vec<(u64, bool)> = snapshot
+                .iter()
+                .filter(|(sub, _, _)| *sub == lname)
+                .map(|(_, ms, id)| (*ms, self.is_known(&g.chat_id, id)))
+                .collect();
+            let newest = catchup::contiguous_known_ms(rows);
+            let key = sub_key(&g.chat_id, name, g.sort);
+            let prev = self.store.checkpoint(&key).unwrap_or_default();
+            self.store.set_checkpoint(key, Checkpoint { newest_ms: prev.newest_ms.max(newest), polled_unix: now });
         }
     }
 
@@ -1028,6 +1345,15 @@ impl Scheduler {
             .collect::<Vec<_>>()
             .join(",");
 
+        // (subreddit, created_ms, id) of everything fetched, for the catch-up checkpoint.
+        let snapshot: Vec<(String, u64, String)> = posts
+            .iter()
+            .map(|p| {
+                let sub = if p.subreddit.is_empty() { g.names[0].as_str() } else { p.subreddit.as_str() };
+                (sub.to_ascii_lowercase(), p.created_ms, p.id.clone())
+            })
+            .collect();
+
         let mut batch_ids = HashSet::new();
         let (mut duplicate_in_batch, mut already_seen) = (0u32, 0u32);
         let mut fresh = Vec::with_capacity(fetched);
@@ -1041,9 +1367,13 @@ impl Scheduler {
             }
         }
 
-        // Reddit returns /new newest-first but /hot best-ranked-first.
-        // Reverse only /new so newly published posts are delivered chronologically.
+        // Reddit returns /new newest-first but /hot best-ranked-first. Reverse only /new so
+        // newly published posts are delivered chronologically; the stable sort then also
+        // interleaves several subreddits (and catch-up pages) by real creation time.
         fresh = delivery_order(fresh, g.sort);
+        if g.sort == Sort::New {
+            fresh.sort_by_key(|p| p.created_ms);
+        }
         let fresh_count = fresh.len() as u32;
         if fresh_count > 0 {
             info!(subs = %g.names.join("+"), sort = g.sort.path(), new = fresh_count, "processing");
@@ -1052,6 +1382,7 @@ impl Scheduler {
         let (mut sent, mut seeded, mut skipped, mut retry_deferred) = (0u32, 0u32, 0u32, 0u32);
         let (mut filtered_nsfw, mut filtered_media_only, mut filtered_spoiler, mut duplicate_media, mut failed) =
             (0u32, 0u32, 0u32, 0u32, 0u32);
+        let (mut expired, mut crossposts_resolved) = (0u32, 0u32);
 
         // Track first-run initialization separately for /new and /hot. Seed every
         // post in each new stream before marking it initialized, including when the
@@ -1076,7 +1407,16 @@ impl Scheduler {
             self.store.mark_sub(&sub_key(chat, name, g.sort));
         }
 
-        for p in fresh {
+        // While catching up, posts older than the maximum catch-up age are marked seen instead of
+        // sent, so a long outage (or an evicted seen-id) can never flood the channel with old posts.
+        let max_age_ms = self.cfg.catchup_max_age.as_millis() as u64;
+        let age_cutoff = if max_age_ms > 0 && g.sort == Sort::New {
+            unix_now().saturating_mul(1000).saturating_sub(max_age_ms)
+        } else {
+            0
+        };
+
+        for mut p in fresh {
             if cycle_started.elapsed() >= self.cfg.cycle_budget {
                 info!(sub = %g.names.join("+"), "cycle delivery budget reached; remaining unseen posts will be picked up next poll");
                 break;
@@ -1084,10 +1424,10 @@ impl Scheduler {
             if self.token.is_cancelled() {
                 return; // unprocessed posts remain unseen and will be picked up next cycle
             }
-            let sub = if p.subreddit.is_empty() { g.names[0].as_str() } else { p.subreddit.as_str() };
+            let sub: String = if p.subreddit.is_empty() { g.names[0].clone() } else { p.subreddit.clone() };
             self.health.set_stage(&format!("post {} from r/{sub}", p.id), 0);
 
-            // Queued items are retried once per cycle independently of the Reddit listing.
+            // Queued items are retried independently of the Reddit listing.
             if self.store.has_pending(chat, &p.id) {
                 retry_deferred += 1;
                 continue;
@@ -1098,10 +1438,33 @@ impl Scheduler {
                 skipped += 1;
                 continue;
             }
+            if age_cutoff > 0
+                && p.created_ms > 0
+                && p.created_ms < age_cutoff
+                && !uninitialized.contains(&sub.to_ascii_lowercase())
+            {
+                self.mark_seen(chat, &p.id);
+                expired += 1;
+                skipped += 1;
+                continue;
+            }
+            if p.crosspost && p.media == Media::None && p.source_url.is_empty() {
+                match self.resolve_crosspost(&p).await {
+                    Ok((media, source_url)) => {
+                        p.media = media;
+                        p.source_url = source_url;
+                        crossposts_resolved += 1;
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        self.record_failure(chat, &p, g.media_only, 0, 1, &error).await;
+                        continue;
+                    }
+                }
+            }
             // Keep unsupported external links in media-only feeds; skip only actual
             // text/self posts that have no external source URL at all.
-            if g.media_only && p.media == Media::None && p.source_url.is_empty()
-                && !(p.nsfw && self.cfg.include_nsfw) {
+            if self.is_text_only_filtered(&p, g.media_only) {
                 self.mark_seen(chat, &p.id);
                 filtered_media_only += 1;
                 skipped += 1;
@@ -1125,20 +1488,7 @@ impl Scheduler {
             }
 
             info!(sub = %sub, post = %p.id, "delivery started");
-            let progress = AtomicUsize::new(0);
-            let outcome = timeout(self.cfg.post_delivery_timeout, async {
-                match &p.media {
-                    Media::Gallery(id) => self.deliver_gallery_post(chat, &p, id, g.media_only, 0, &progress).await,
-                    _ => (0, self.deliverer.deliver(chat, &p, g.media_only).await),
-                }
-            }).await;
-            let (gallery_index, result) = match outcome {
-                Ok(result) => result,
-                Err(_) => (
-                    progress.load(Ordering::Relaxed),
-                    Err(anyhow::anyhow!("post delivery timed out after {}s", self.cfg.post_delivery_timeout.as_secs())),
-                ),
-            };
+            let (gallery_index, result) = self.deliver_post(chat, &p, g.media_only, 0).await;
             match result {
                 Ok(()) => {
                     info!(sub = %sub, post = %p.id, "delivered post");
@@ -1151,28 +1501,13 @@ impl Scheduler {
                 }
                 Err(error) => {
                     failed += 1;
-                    let delay = delivery_retry_delay(self.cfg.interval, 1);
-                    self.store.upsert_pending(PendingDelivery {
-                        chat: chat.to_string(),
-                        post: p.clone(),
-                        media_only: g.media_only,
-                        attempts: 1,
-                        retry_at_unix: unix_now().saturating_add(delay.as_secs()),
-                        gallery_index,
-                    });
-                    // Persist failures immediately: a process restart must not erase
-                    // the retry queue or a gallery's resume position.
-                    self.store.flush().await;
-                    warn!(
-                        sub = %sub,
-                        post = %p.id,
-                        attempt = 1,
-                        retry_in_secs = delay.as_secs(),
-                        reason = %error,
-                        "delivery failed; persisted retry queued"
-                    );
+                    self.record_failure(chat, &p, g.media_only, gallery_index, 1, &error).await;
                 }
             }
+        }
+
+        if g.sort == Sort::New {
+            self.update_checkpoints(g, &snapshot);
         }
         info!(
             subs = %g.names.join("+"),
@@ -1183,6 +1518,8 @@ impl Scheduler {
             already_seen,
             duplicate_in_batch,
             seeded,
+            expired,
+            crossposts_resolved,
             filtered_nsfw,
             filtered_media_only,
             filtered_spoiler,
@@ -1211,6 +1548,8 @@ mod tests {
             subreddit: "anime".into(),
             spoiler,
             nsfw: false,
+            created_ms: 0,
+            crosspost: false,
         }
     }
 
@@ -1385,5 +1724,24 @@ mod tests {
         assert_eq!(delivery_retry_delay(interval, 2).as_secs(), 1200);
         assert_eq!(delivery_retry_delay(interval, 3).as_secs(), 2400);
         assert_eq!(delivery_retry_delay(interval, 99).as_secs(), 6 * 60 * 60);
+    }
+
+    #[test]
+    fn permanent_item_errors_are_not_retried() {
+        let e = |m: &str| anyhow::anyhow!("{m}");
+        assert!(is_permanent_item_error(&e("download failed: HTTP 404")));
+        assert!(is_permanent_item_error(&e("download returned text/html instead of media")));
+        assert!(is_permanent_item_error(&md::TooLarge(99).into()));
+        assert!(!is_permanent_item_error(&e("download failed: HTTP 429")));
+        assert!(!is_permanent_item_error(&e("download failed: HTTP 503")));
+        assert!(!is_permanent_item_error(&e("operation timed out")));
+    }
+
+    #[test]
+    fn reddit_video_ids_are_extracted_safely() {
+        assert_eq!(vreddit_id("https://v.redd.it/abc123/DASH_720.mp4"), Some("abc123".to_string()));
+        assert_eq!(vreddit_id("https://v.redd.it/abc123?x=1"), Some("abc123".to_string()));
+        assert_eq!(vreddit_id("https://i.redd.it/abc123.jpg"), None);
+        assert_eq!(vreddit_id("https://v.redd.it/../x"), None);
     }
 }

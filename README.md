@@ -8,6 +8,35 @@ Telegram via the Bot API.
 
 Your existing Python implementation is untouched: this lives in its own directory.
 
+## What changed in this revision
+
+**Videos**
+- Reddit renditions are read from the post's DASH manifest (`DASHPlaylist.mpd`) instead of blind HEAD-probing. If the best rendition is too large or fails, the next lower one is tried (before, a too-large 1080p aborted the whole post). Audio is chosen the same way and muxed with a stream copy.
+- Every video is re-indexed with `-movflags +faststart` (stream copy, no re-encode), probed with `ffprobe`, and sent with **width, height, duration and a thumbnail**. Before, Telegram received a bare file and often showed wrong proportions, no length, or no preview.
+- Silent clips up to 60 s go out as Telegram animations (like Reddit's own "gif" videos). `SILENT_VIDEO_AS_ANIMATION=false` keeps them as videos.
+- Downloads now use the response `Content-Type` for the file type, and refuse HTML/JSON error pages served with HTTP 200 (previously such a page could be uploaded as a *document*).
+- Files over Telegram's limit are a permanent failure and are dropped instead of being retried for hours.
+
+**Galleries**
+- Metadata lookup and delivery now have **separate time budgets** (`GALLERY_RESOLVE_TIMEOUT_SECS`, then `POST_DELIVERY_TIMEOUT_SECS` + 10 s per item). Before, one slow lookup could use the entire 180 s post deadline and leave nothing for uploading.
+- The HTML fallback now runs after *any* JSON failure (it previously ran only after an explicit "blocked by network security" page), and it understands old.reddit gallery tiles (the old third fallback loaded an old.reddit page but looked for new-Reddit elements, so it could never succeed).
+- A dead image (HTTP 4xx, wrong content, too large) is skipped instead of failing the whole gallery forever; transient errors still retry the whole post. Gallery videos hosted on v.redd.it get audio.
+- A post-level timeout no longer abandons a half-finished browser page.
+
+**Catch-up ("start from the last log")**
+- The state file now stores a **checkpoint per subreddit/channel/sort**: the newest post such that it and everything older has been handled, plus the time of the last good poll. Existing state files load unchanged.
+- For `new` feeds, each poll follows the listing's `after` cursor page by page until a page ends in posts already handled, the page cap `CATCHUP_MAX_PAGES` is hit, or posts older than the checkpoint (minus 3 h for late-approved posts) or `CATCHUP_MAX_AGE_HOURS` are reached. Everything unseen is delivered oldest-first. In normal operation that is still one page load per subreddit.
+- This fixes the main cause of missed posts: a busy subreddit pushing more than `POST_LIMIT` posts onto the first page between polls, or the bot being offline/rate-limited. A warning is logged when the window is exhausted.
+- **Crossposts** used to be dropped silently in media-only mode (their URL is the original's permalink). They are now resolved to the original's image/video/gallery/link.
+- A failed fetch is retried once with a fresh browser; one page failing mid-catch-up no longer discards the pages already read; a failing post is given up on after `MAX_DELIVERY_ATTEMPTS`.
+- Mature-content/quarantine interstitials are now reported instead of looking like an empty subreddit.
+- First run is unchanged: a stream with no history is seeded, not flooded (`SEND_BACKLOG_ON_FIRST_RUN`).
+
+**Altare**
+- Optional `.env` file; `SERVER_PORT` is honoured; the health endpoint can be disabled; binaries are auto-discovered; startup prints which of Lightpanda/ffmpeg/ffprobe were found and what degrades without them; temp files go to `/home/container/tmp` and stale ones are purged; the browser is stopped between polls; Lightpanda telemetry is disabled.
+
+> **Not verified against live services.** The Rust code could not be compiled where these changes were written, and nothing was tested against live Reddit or Telegram. Run `cargo test` first. The JavaScript extraction and the ffmpeg commands were exercised against local fixtures. Details that depend on Reddit's real markup (`data-timestamp`, the next-button link, the old.reddit gallery tiles, the crosspost URL shape) are assumptions to confirm with `fetch-test`.
+
 ## How it works
 - `reddit_browser.rs` – spawns `lightpanda serve`, talks CDP over WebSocket, opens one target, navigates,
   runs an extraction script in the page, closes the target. Browser is recycled every `BROWSER_RECYCLE_CYCLES` cycles
@@ -18,7 +47,7 @@ Your existing Python implementation is untouched: this lives in its own director
 - `telegram.rs` – direct Bot API, streamed multipart uploads, retry on 429 (`retry_after`) / 5xx.
 - `seen_store.rs` – bounded seen IDs and initialized-subreddit markers saved to one local JSON file on the host.
 - `main.rs` – logs to both the Altare console and a separate rotating log file; log files never share the seen-state directory.
-- `scheduler.rs` – sequential polling with a cycle-wide time budget, bounded post delivery, one persisted retry per cycle, and exponential backoff on rate limit / delivery failures.
+- `scheduler.rs` – sequential polling with a cycle-wide time budget, bounded post delivery, a small persisted retry batch per cycle, and exponential backoff on rate limit / delivery failures.
 - `health.rs`, `self_ping.rs` – `/health` (200/503) and optional best-effort self-ping.
 
 SQLite and remote state services are deliberately not used. The bot stores its bounded state in a local JSON file; it needs no GitHub token, database, or external state service.
@@ -52,8 +81,8 @@ SPOILER_MODE=mark                               # mark | skip | ignore
   `GALLERY_LOOKUP_TIMEOUT_SECS`; media acquisition / video probing is bounded by `MEDIA_DOWNLOAD_TIMEOUT_SECS`; each
   Telegram send (including fast retries) is bounded by `TELEGRAM_TIMEOUT_SECS`; and a post is bounded by
   `POST_DELIVERY_TIMEOUT_SECS`. Defaults are 30 / 120 / 120 / 180 seconds respectively (gallery / media / Telegram / post).
-  Allowed ranges are validated on startup. Fresh subreddit feeds are checked before the retry queue, and at most one due
-  failed post is retried per cycle so old failures cannot monopolize polling.
+  Allowed ranges are validated on startup. Fresh subreddit feeds are checked before the retry queue, and at most `RETRY_BATCH` (default 3) due
+  failed posts are retried per cycle so old failures cannot monopolize polling.
 - Telegram sends to one channel are spaced by `SEND_GAP_MS` (3 s) to stay under ~20 messages/minute; a busy 30-sub channel
   may therefore lag. Dirty seen-state data is written locally no more often than `STATE_FLUSH_MIN_SECS`; it is also saved on shutdown.
 - **Host-local persistence:** the default Altare path is `/home/container/data/seen_posts.json`. The directory is created automatically. Keep this path on the server's persistent filesystem; do not put it under a temporary/cache directory. On a host that replaces its entire filesystem on redeploy, mount or select a persistent data directory and set `STATE_PATH` to that location.
@@ -99,7 +128,7 @@ readable text, and whether Reddit rate-limits these extra loads.
   Retries survive process restarts and continue even after a post drops out of the current Reddit listing.
 - Media: photo → `sendPhoto` (oversized/rejected → resized, still a photo; document only as last resort); GIF → `sendAnimation`;
   MP4 / v.redd.it → `sendVideo`. A failed or oversized media download remains unseen and enters the persistent retry queue; it is not silently marked done. Unsupported external URLs are sent as Reddit-link messages. Downloads only from `i.redd.it`, `preview.redd.it`, `v.redd.it`, `i.imgur.com` over https.
-- Reddit video: tries `DASH_1080…240` and `DASH_AUDIO_*` by HEAD probing (not parsing the MPD). Untested against live Reddit.
+- Reddit video: renditions are read from the DASHPlaylist.mpd manifest (falling back to HEAD-probing `CMAF_*`/`DASH_*` names if it is unavailable). Untested against live Reddit.
 - Reddit blocks/CAPTCHAs/login walls are reported and skipped with backoff. Old Reddit now requires a logged-in session.
   For the Lightpanda browser flow, set `REDDIT_SESSION_COOKIE` in the host's secret environment variables to the value
   of the `reddit_session` cookie from an account that can access Old Reddit. Never put the cookie in this file, a commit,
@@ -107,13 +136,13 @@ readable text, and whether Reddit rate-limits these extra loads.
   The bot does not bypass CAPTCHA or other access controls. Lightpanda sends its own User-Agent; it is not spoofed.
 
 ## Deploy on Altare
-1. Build with `cargo build --release` and start `./target/release/reddit-telegram-bot`.
-2. Set the required Telegram and subreddit environment variables from `.env.example`.
-3. Set `STATE_PATH=/home/container/data/seen_posts.json` and `LOG_PATH=/home/container/logs/bot.log`; these directories are created automatically and are separate.
-4. Set `INCLUDE_NSFW=true` (default). On the Reddit account used for `REDDIT_SESSION_COOKIE`, enable mature content in Reddit settings and in [Old Reddit preferences](https://old.reddit.com/prefs/).
-5. Install Lightpanda at the configured `LIGHTPANDA_BIN` path and make it executable.
-6. Add your bot as an administrator of each target Telegram channel.
-7. Check startup logs for `file logging enabled`, `seen state restored from host storage`, or `no local seen-state file yet`.
+1. **Get the binary.** Building Rust on a small panel server can run out of RAM. Instead use the *Altare build* GitHub Action (Actions tab, run it, download the `reddit-telegram-bot-linux-x86_64` artifact). It is built on Debian 12 so it runs on hosts with older glibc. Upload it to `/home/container/` and make it executable.
+2. **Upload helpers** next to it: the Lightpanda Linux x86_64 binary (`lightpanda`, executable) and optionally static `ffmpeg` + `ffprobe` builds. Without ffmpeg the bot still works, but videos have no audio and oversized images cannot be resized.
+3. **Settings:** put them in the panel's variables, or copy `.env.example` to `/home/container/.env` and fill it in (never commit it). `TELEGRAM_BOT_TOKEN`, `DEFAULT_CHAT_ID`, `SUBREDDITS` and `REDDIT_SESSION_COOKIE` are the essentials.
+4. Startup command: `./reddit-telegram-bot`.
+5. Add the bot as an administrator of each target Telegram channel.
+6. Check the startup log for `Lightpanda browser found`, `ffmpeg found`, `ffprobe found`, `seen state restored from host storage` (or `no local seen-state file yet`), and `file logging enabled`.
+7. On the Reddit account used for the cookie, enable mature content in Reddit and [old Reddit preferences](https://old.reddit.com/prefs/) if `INCLUDE_NSFW=true`.
 
 There is no GitHub token, GitHub state branch, or GitHub API dependency. The local JSON file is the only seen-state store. A host-side backup/export is recommended before server reinstall or deletion.
 

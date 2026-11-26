@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use crate::reddit_parser::Post;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io,
     path::{Path, PathBuf},
     time::Duration,
@@ -27,6 +27,18 @@ pub struct PendingDelivery {
     pub gallery_index: usize,
 }
 
+/// "Last log" of one subreddit/channel/sort stream, used to catch up on posts missed while the
+/// bot was down, rate-limited or busy.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// Newest post time (ms since the epoch) such that it and every older fetched post is known.
+    #[serde(default)]
+    pub newest_ms: u64,
+    /// Unix seconds when this stream last finished a normal poll.
+    #[serde(default)]
+    pub polled_unix: u64,
+}
+
 fn pending_key(chat: &str, id: &str) -> String {
     format!("{}|{id}", chat.to_ascii_lowercase())
 }
@@ -36,6 +48,7 @@ struct StateRef<'a> {
     ids: &'a VecDeque<String>,
     subs: Vec<&'a str>,
     pending: Vec<&'a PendingDelivery>,
+    checkpoints: &'a BTreeMap<String, Checkpoint>,
 }
 
 #[derive(Deserialize, Default)]
@@ -46,6 +59,8 @@ struct State {
     subs: Vec<String>,
     #[serde(default)]
     pending: Vec<PendingDelivery>,
+    #[serde(default)]
+    checkpoints: BTreeMap<String, Checkpoint>,
 }
 
 pub struct SeenStore {
@@ -53,6 +68,7 @@ pub struct SeenStore {
     set: HashSet<String>,
     subs: HashSet<String>,
     pending: HashMap<String, PendingDelivery>,
+    checkpoints: BTreeMap<String, Checkpoint>,
     dirty: bool,
     path: PathBuf,
     cap: usize,
@@ -66,6 +82,7 @@ impl SeenStore {
             set: HashSet::new(),
             subs: HashSet::new(),
             pending: HashMap::new(),
+            checkpoints: BTreeMap::new(),
             dirty: false,
             path,
             cap,
@@ -120,6 +137,7 @@ impl SeenStore {
         for pending in state.pending {
             self.pending.insert(pending_key(&pending.chat, &pending.post.id), pending);
         }
+        self.checkpoints.extend(state.checkpoints);
     }
 
     fn insert_inner(&mut self, id: String) -> bool {
@@ -187,6 +205,17 @@ impl SeenStore {
         due
     }
 
+    pub fn checkpoint(&self, key: &str) -> Option<Checkpoint> {
+        self.checkpoints.get(key).cloned()
+    }
+
+    pub fn set_checkpoint(&mut self, key: String, cp: Checkpoint) {
+        if self.checkpoints.get(&key) != Some(&cp) {
+            self.checkpoints.insert(key, cp);
+            self.dirty = true;
+        }
+    }
+
     pub fn mark_sub(&mut self, sub: &str) {
         if self.subs.insert(sub.to_ascii_lowercase()) {
             self.dirty = true;
@@ -201,7 +230,7 @@ impl SeenStore {
             a.chat.to_ascii_lowercase().cmp(&b.chat.to_ascii_lowercase())
                 .then_with(|| a.post.id.cmp(&b.post.id))
         });
-        Ok(serde_json::to_vec(&StateRef { ids: &self.order, subs, pending })?)
+        Ok(serde_json::to_vec(&StateRef { ids: &self.order, subs, pending, checkpoints: &self.checkpoints })?)
     }
 
     /// Persist changes locally. The temp-file + rename pattern avoids leaving a
@@ -321,6 +350,8 @@ mod tests {
             subreddit: "anime".into(),
             spoiler: false,
             nsfw: false,
+            created_ms: 0,
+            crosspost: false,
         };
         let mut s = SeenStore::new(p.clone(), 100);
         s.upsert_pending(PendingDelivery {
@@ -340,6 +371,24 @@ mod tests {
         assert_eq!(due[0].post.title, "A title");
         assert_eq!(due[0].attempts, 2);
         assert_eq!(due[0].gallery_index, 3);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test]
+    async fn checkpoints_survive_restart_and_old_state_files_still_load() {
+        let p = tmp("checkpoints");
+        let _ = std::fs::remove_file(&p);
+        let mut s = SeenStore::new(p.clone(), 100);
+        s.set_checkpoint("@a|anime|new".into(), Checkpoint { newest_ms: 1700000000000, polled_unix: 42 });
+        s.flush().await;
+        let s2 = SeenStore::open(p.clone(), 100).await.unwrap();
+        assert_eq!(s2.checkpoint("@a|anime|new"), Some(Checkpoint { newest_ms: 1700000000000, polled_unix: 42 }));
+        assert_eq!(s2.checkpoint("@a|manga|new"), None);
+
+        // A state file written by an older build has no "checkpoints" key.
+        tokio::fs::write(&p, br#"{"ids":["x"],"subs":["@a|anime|new"],"pending":[]}"#).await.unwrap();
+        let s3 = SeenStore::open(p.clone(), 100).await.unwrap();
+        assert!(s3.contains("x") && s3.checkpoint("@a|anime|new").is_none());
         let _ = std::fs::remove_file(&p);
     }
 

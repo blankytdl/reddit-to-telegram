@@ -1,3 +1,4 @@
+mod catchup;
 mod config;
 mod health;
 mod media_downloader;
@@ -70,10 +71,11 @@ impl Write for LogWriter {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let path = PathBuf::from(
-        std::env::var_os("LOG_PATH").unwrap_or_else(|| "/home/container/logs/bot.log".into()),
-    );
+    let filter = match env_get("RUST_LOG") {
+        Some(v) => EnvFilter::try_new(v).unwrap_or_else(|_| EnvFilter::new("info")),
+        None => EnvFilter::new("info"),
+    };
+    let path = PathBuf::from(env_get("LOG_PATH").unwrap_or_else(|| "/home/container/logs/bot.log".into()));
     let file_writer = (|| -> io::Result<LogMakeWriter> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -122,7 +124,11 @@ fn http_client() -> Result<Client> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
+    let dotenv = config::load_dotenv();
     init_tracing();
+    if let Some((path, keys)) = dotenv {
+        info!(file = %path.display(), keys, "loaded settings from env file (real environment variables take precedence)");
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("fetch-test") => fetch_test(&args).await,
@@ -164,6 +170,18 @@ async fn run() -> Result<()> {
     let token = CancellationToken::new();
     let health = Arc::new(health::Health::new());
 
+    if let Some(dir) = &cfg.temp_dir {
+        match fs::create_dir_all(dir) {
+            Ok(()) => md_set_temp_dir(dir.clone()),
+            Err(e) => tracing::warn!(dir = %dir.display(), "cannot create temp dir ({e}); using the system temp dir"),
+        }
+    }
+    let stale = media_downloader::cleanup_temp(Duration::ZERO);
+    if stale > 0 {
+        info!(stale, "removed temporary media files left over from a previous run");
+    }
+    preflight(&cfg).await?;
+
     tokio::spawn({
         let t = token.clone();
         async move {
@@ -174,7 +192,12 @@ async fn run() -> Result<()> {
     });
 
     // Bind the port first so Render's port scan succeeds while state is restored.
-    let hs = tokio::spawn(health::serve(cfg.port, health.clone(), token.clone()));
+    let hs = if cfg.health_enabled {
+        tokio::spawn(health::serve(cfg.port, health.clone(), token.clone()))
+    } else {
+        info!("health server disabled (HEALTH_ENABLED=false)");
+        tokio::spawn(async { Ok::<(), anyhow::Error>(()) })
+    };
 
     info!(state_path = %cfg.state_path.display(), "using host-local seen-state storage");
     let store = seen_store::SeenStore::open(cfg.state_path.clone(), cfg.seen_cap).await?;
@@ -198,6 +221,65 @@ async fn run() -> Result<()> {
     token.cancel();
     let _ = timeout(Duration::from_secs(5), hs).await;
     info!("bye");
+    Ok(())
+}
+
+fn md_set_temp_dir(dir: PathBuf) {
+    media_downloader::set_temp_dir(dir);
+}
+
+/// True if `bin` is an existing file (when it contains a path separator) or is found on PATH.
+fn binary_exists(bin: &str) -> bool {
+    if bin.contains('/') {
+        return std::path::Path::new(bin).is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+/// Runs a binary with `-version` and returns its first output line.
+async fn binary_version(bin: &str, arg: &str) -> Option<String> {
+    let out = timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(bin)
+            .arg(arg)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let text = String::from_utf8_lossy(if out.stdout.is_empty() { &out.stderr } else { &out.stdout }).to_string();
+    text.lines().next().map(|l| l.trim().to_string())
+}
+
+/// Startup diagnostics: tells the operator exactly which helper binaries were found and what
+/// degrades without them, instead of failing mysteriously later.
+async fn preflight(cfg: &Config) -> Result<()> {
+    let browser = &cfg.browser.bin;
+    if !binary_exists(browser) {
+        return Err(anyhow!(
+            "Lightpanda browser not found at {browser:?}. Upload the lightpanda binary to the server (for example /home/container/lightpanda), \
+             make it executable, or set LIGHTPANDA_BIN to its path."
+        ));
+    }
+    info!(path = %browser, "Lightpanda browser found");
+    match binary_version(&cfg.ffmpeg_bin, "-version").await {
+        Some(v) => info!(path = %cfg.ffmpeg_bin, version = %v, "ffmpeg found"),
+        None => tracing::warn!(
+            path = %cfg.ffmpeg_bin,
+            "ffmpeg not found: Reddit videos will be sent WITHOUT audio, oversized images cannot be resized and gallery videos are skipped. Upload an ffmpeg binary or set FFMPEG_BIN."
+        ),
+    }
+    match binary_version(&cfg.ffprobe_bin, "-version").await {
+        Some(v) => info!(path = %cfg.ffprobe_bin, version = %v, "ffprobe found"),
+        None => tracing::warn!(
+            path = %cfg.ffprobe_bin,
+            "ffprobe not found: videos are sent without width/height/duration/thumbnail and image resizing is unavailable. Set FFPROBE_BIN."
+        ),
+    }
     Ok(())
 }
 
@@ -254,6 +336,8 @@ async fn media_test(args: &[String]) -> Result<()> {
         subreddit: "test".into(),
         spoiler: args.get(4).map(|a| a == "spoiler").unwrap_or(false),
         nsfw: false,
+        created_ms: 0,
+        crosspost: false,
     };
     println!("classified as {:?}", post.media);
     d.deliver(chat, &post, false).await?;

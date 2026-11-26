@@ -25,10 +25,16 @@ struct RawPost {
     spoiler: bool,
     #[serde(default)]
     nsfw: bool,
+    /// Milliseconds since the epoch (old Reddit `data-timestamp`); 0 when unknown.
+    #[serde(default)]
+    created_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawPage {
+    /// `after=` cursor of the "next" button, when the listing has another page.
+    #[serde(default)]
+    after: String,
     #[serde(default)]
     title: String,
     #[serde(default)]
@@ -62,6 +68,29 @@ pub struct Post {
     pub subreddit: String,
     pub spoiler: bool,
     pub nsfw: bool,
+    /// Milliseconds since the epoch; 0 when unknown.
+    #[serde(default)]
+    pub created_ms: u64,
+    /// The post links to another Reddit post (a crosspost); its real media must be looked up.
+    #[serde(default)]
+    pub crosspost: bool,
+}
+
+/// Bare post id from a reddit `/comments/<id>/...` URL or path.
+fn comments_id(url: &str) -> Option<String> {
+    let rest = url.split("/comments/").nth(1)?;
+    let id = rest.split(['/', '?', '#']).next()?;
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(id.to_ascii_lowercase())
+}
+
+/// Only `t3_<base36>` cursors are accepted (they are placed into a URL).
+fn valid_after(cursor: &str) -> bool {
+    cursor
+        .strip_prefix("t3_")
+        .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 impl Media {
@@ -314,6 +343,11 @@ pub fn parse_gallery(json: &str) -> Result<Vec<GalleryItem>> {
 }
 
 pub fn parse_page(json: &str, limit: usize) -> Result<PageStatus> {
+    Ok(parse_listing(json, limit)?.0)
+}
+
+/// Like `parse_page`, plus the cursor for the next listing page (if there is one).
+pub fn parse_listing(json: &str, limit: usize) -> Result<(PageStatus, Option<String>)> {
     let page: RawPage = serde_json::from_str(json).context("extraction JSON was not valid")?;
     let haystack = format!("{} {}", page.title, page.text).to_ascii_lowercase();
     let page_url = page.url.to_ascii_lowercase();
@@ -323,17 +357,38 @@ pub fn parse_page(json: &str, limit: usize) -> Result<PageStatus> {
             || haystack.contains("log in to use old reddit")
             || haystack.contains("accounts are required to access old reddit")
         {
-            return Ok(PageStatus::Blocked("old Reddit login wall (reason=lor2)".into()));
+            return Ok((PageStatus::Blocked("old Reddit login wall (reason=lor2)".into()), None));
         }
         if haystack.contains("too many requests") {
-            return Ok(PageStatus::RateLimited);
+            return Ok((PageStatus::RateLimited, None));
         }
         for needle in ["whoa there, pardner", "blocked", "captcha", "verify you are", "access denied", "log in to continue"] {
             if haystack.contains(needle) {
-                return Ok(PageStatus::Blocked(needle.to_string()));
+                return Ok((PageStatus::Blocked(needle.to_string()), None));
+            }
+        }
+        // Mature-content / quarantine gates show an interstitial with no posts. Report them
+        // instead of silently treating the subreddit as empty forever.
+        for needle in ["are you over eighteen", "you must be at least eighteen", "this community is quarantined"] {
+            if haystack.contains(needle) {
+                return Ok((PageStatus::Blocked(format!("{needle} (account needs mature-content access)")), None));
             }
         }
     }
+
+    // Cursor for the next page: the "next" button, else the last real post when the page is full.
+    let real: Vec<&RawPost> = page
+        .posts
+        .iter()
+        .filter(|p| p.fullname.starts_with("t3_") && !p.promoted)
+        .collect();
+    let after = if valid_after(&page.after) {
+        Some(page.after.clone())
+    } else if real.len() >= limit && !real.is_empty() && valid_after(&real[real.len() - 1].fullname) {
+        Some(real[real.len() - 1].fullname.clone())
+    } else {
+        None
+    };
 
     let posts = page
         .posts
@@ -347,11 +402,18 @@ pub fn parse_page(json: &str, limit: usize) -> Result<PageStatus> {
                 p.permalink.clone()
             };
             let external = p.url.starts_with("http") && !p.url.contains("reddit.com/r/");
+            // A crosspost's URL is the original post's permalink (a different id than its own).
+            let own_id = p.fullname.trim_start_matches("t3_").to_ascii_lowercase();
+            let crosspost = !external
+                && classify_media(&p.url) == Media::None
+                && comments_id(&p.url).is_some_and(|linked| linked != own_id);
             Post {
                 media: classify_media(&p.url),
                 source_url: if external { p.url.clone() } else { String::new() },
                 spoiler: p.spoiler || title_has_spoiler_tag(&p.title),
                 nsfw: p.nsfw,
+                created_ms: p.created_ms,
+                crosspost,
                 subreddit: p.subreddit,
                 // Same id format as the Python bot (bare lowercase base-36), so old state matches.
                 id: p.fullname.trim_start_matches("t3_").to_ascii_lowercase(),
@@ -361,7 +423,45 @@ pub fn parse_page(json: &str, limit: usize) -> Result<PageStatus> {
             }
         })
         .collect();
-    Ok(PageStatus::Ok(posts))
+    Ok((PageStatus::Ok(posts), after))
+}
+
+/// Finds the post object in a `by_id` / comments JSON response.
+fn find_post_data(v: &serde_json::Value) -> Option<&serde_json::Value> {
+    let listing = if v.is_array() { v.get(0)? } else { v };
+    listing.get("data")?.get("children")?.get(0)?.get("data")
+}
+
+/// Resolves what a (crosspost) submission really contains. Returns the media and, for external
+/// links, the link itself. Follows `crosspost_parent_list` to the original post.
+pub fn media_from_post_json(json: &str) -> Result<(Media, String)> {
+    let input = json.trim().trim_start_matches('\u{feff}');
+    let v: serde_json::Value = serde_json::from_str(input).context("post response was not valid JSON")?;
+    let mut data = find_post_data(&v).ok_or_else(|| anyhow!("Reddit JSON did not contain a post"))?;
+    if let Some(parent) = data
+        .get("crosspost_parent_list")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|list| list.first())
+    {
+        data = parent;
+    }
+    let id = data.get("id").and_then(serde_json::Value::as_str).unwrap_or("");
+    if data.get("is_gallery").and_then(serde_json::Value::as_bool) == Some(true)
+        && !id.is_empty()
+        && id.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return Ok((Media::Gallery(id.to_string()), String::new()));
+    }
+    let url = data
+        .get("url_overridden_by_dest")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| data.get("url").and_then(serde_json::Value::as_str))
+        .unwrap_or("")
+        .replace("&amp;", "&");
+    let external = url.starts_with("http") && !url.contains("reddit.com/r/");
+    let media = classify_media(&url);
+    let source = if media == Media::None && external { url } else { String::new() };
+    Ok((media, source))
 }
 
 #[cfg(test)]
@@ -502,5 +602,51 @@ mod tests {
         let empty = r#"{"title":"x","text":"","url":"https://old.reddit.com/r/anime/new/","posts":[]}"#;
         assert!(matches!(parse_page(empty, 5).unwrap(), PageStatus::Ok(v) if v.is_empty()));
         assert!(parse_page("not json", 5).is_err());
+    }
+
+    #[test]
+    fn reads_timestamp_cursor_and_detects_crossposts() {
+        let j = r#"{"title":"x","text":"","after":"t3_zzz","posts":[
+          {"fullname":"t3_aaa","author":"b","permalink":"/r/x/comments/aaa/t/","url":"/r/x/comments/aaa/t/","title":"Self","created_ms":1700000000000},
+          {"fullname":"t3_bbb","author":"b","permalink":"/r/x/comments/bbb/t/","url":"/r/orig/comments/ccc/original/","title":"Cross","created_ms":1700000100000},
+          {"fullname":"t3_ddd","author":"b","permalink":"/r/x/comments/ddd/t/","url":"https://example.com/page","title":"Link"}]}"#;
+        let (status, after) = parse_listing(j, 10).unwrap();
+        let PageStatus::Ok(p) = status else { panic!() };
+        assert_eq!(after.as_deref(), Some("t3_zzz"));
+        assert_eq!(p[0].created_ms, 1700000000000);
+        assert!(!p[0].crosspost);
+        assert!(p[1].crosspost && p[1].media == Media::None);
+        assert!(!p[2].crosspost && p[2].created_ms == 0);
+    }
+
+    #[test]
+    fn cursor_falls_back_to_last_post_only_for_full_pages() {
+        let j = r#"{"title":"x","text":"","posts":[
+          {"fullname":"t3_aaa","author":"b","permalink":"/r/x/comments/aaa/t/","url":"","title":"One"},
+          {"fullname":"t3_bbb","author":"b","permalink":"/r/x/comments/bbb/t/","url":"","title":"Two"}]}"#;
+        assert_eq!(parse_listing(j, 2).unwrap().1.as_deref(), Some("t3_bbb"));
+        assert_eq!(parse_listing(j, 5).unwrap().1, None);
+        let bad = r#"{"title":"x","text":"","after":"t3_x&evil=1","posts":[]}"#;
+        assert_eq!(parse_listing(bad, 5).unwrap().1, None);
+    }
+
+    #[test]
+    fn detects_mature_content_gate() {
+        let gate = r#"{"title":"over 18?","text":"You must be at least eighteen years old to view this content.","url":"https://old.reddit.com/r/x/new/","posts":[]}"#;
+        assert!(matches!(parse_page(gate, 5).unwrap(), PageStatus::Blocked(r) if r.contains("eighteen")));
+    }
+
+    #[test]
+    fn resolves_crosspost_media_from_by_id_json() {
+        let video = r#"{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"id":"bbb","url":"https://www.reddit.com/r/orig/comments/ccc/original/",
+          "crosspost_parent_list":[{"id":"ccc","url":"https://v.redd.it/abc123"}]}}]}}"#;
+        assert_eq!(media_from_post_json(video).unwrap(), (Media::RedditVideo("abc123".into()), String::new()));
+        let gallery = r#"[{"data":{"children":[{"data":{"id":"bbb","crosspost_parent_list":[{"id":"ggg","is_gallery":true,"url":"https://www.reddit.com/gallery/ggg"}]}}]}}]"#;
+        assert_eq!(media_from_post_json(gallery).unwrap().0, Media::Gallery("ggg".into()));
+        let link = r#"{"data":{"children":[{"data":{"id":"x","url":"https://example.com/a?b=1&amp;c=2"}}]}}"#;
+        let (media, source) = media_from_post_json(link).unwrap();
+        assert_eq!(media, Media::None);
+        assert_eq!(source, "https://example.com/a?b=1&c=2");
+        assert!(media_from_post_json("<html>").is_err());
     }
 }

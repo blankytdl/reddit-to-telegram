@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Result};
-use std::{path::PathBuf, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::OnceLock, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sort {
@@ -139,6 +139,22 @@ pub struct Config {
     pub caption: CaptionOpts,
     pub recycle_cycles: u64,
     pub seen_cap: usize,
+    /// Total listing pages fetched per subreddit per cycle while catching up (1 = no paging).
+    pub catchup_max_pages: usize,
+    /// Posts older than this are never sent while catching up (ZERO = no limit).
+    pub catchup_max_age: Duration,
+    /// Due retries attempted per cycle.
+    pub retry_batch: usize,
+    /// A failing post is given up on (marked seen) after this many attempts.
+    pub max_delivery_attempts: u8,
+    /// Total time allowed to look up one gallery's media list.
+    pub gallery_resolve_timeout: Duration,
+    /// Stop the browser between polls to free memory on small hosts.
+    pub browser_idle_shutdown: bool,
+    /// Send silent videos (Reddit "gifs") as Telegram animations.
+    pub silent_as_animation: bool,
+    pub health_enabled: bool,
+    pub temp_dir: Option<PathBuf>,
 }
 
 type Get<'a> = &'a dyn Fn(&str) -> Option<String>;
@@ -186,8 +202,76 @@ fn s(get: Get, key: &str, default: &str) -> String {
     get(key).unwrap_or_else(|| default.to_string())
 }
 
+static DOTENV: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// Real environment variables win; values from a `.env` file (see `load_dotenv`) are the fallback.
 pub fn env_get(k: &str) -> Option<String> {
-    std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    std::env::var(k)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            DOTENV
+                .get()
+                .and_then(|m| m.get(k))
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+}
+
+/// Parses `KEY=VALUE` lines (comments, `export `, and surrounding quotes allowed).
+pub fn parse_dotenv(text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let mut value = value.trim();
+        for quote in ['"', '\''] {
+            if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
+                value = &value[1..value.len() - 1];
+                break;
+            }
+        }
+        out.insert(key.to_string(), value.to_string());
+    }
+    out
+}
+
+/// Loads `.env` (or the file named by ENV_FILE) so hosts without an environment-variable panel
+/// work too. Returns the file used and how many keys it defined; values are never logged.
+pub fn load_dotenv() -> Option<(PathBuf, usize)> {
+    let candidates: Vec<PathBuf> = match std::env::var("ENV_FILE") {
+        Ok(f) if !f.trim().is_empty() => vec![PathBuf::from(f.trim())],
+        _ => vec![PathBuf::from(".env"), PathBuf::from("/home/container/.env")],
+    };
+    for path in candidates {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let map = parse_dotenv(&text);
+            let n = map.len();
+            let _ = DOTENV.set(map);
+            return Some((path, n));
+        }
+    }
+    None
+}
+
+/// First existing file among the usual panel locations, else the bare name (PATH lookup).
+pub fn discover_binary(name: &str) -> String {
+    for dir in [".", "/home/container", "/home/container/bin", "/usr/local/bin", "/usr/bin"] {
+        let candidate = std::path::Path::new(dir).join(name);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    name.to_string()
 }
 
 fn norm_name(n: &str) -> Result<String> {
@@ -230,7 +314,7 @@ fn add_sub(
 impl BrowserSettings {
     pub fn from_lookup(get: Get) -> Result<Self> {
         Ok(Self {
-            bin: s(get, "LIGHTPANDA_BIN", "/usr/local/bin/lightpanda"),
+            bin: s(get, "LIGHTPANDA_BIN", &discover_binary("lightpanda")),
             port: num(get, "LIGHTPANDA_PORT", 9222u16)?,
             extra_args: get("LIGHTPANDA_EXTRA_ARGS")
                 .map(|v| v.split_whitespace().map(String::from).collect())
@@ -342,11 +426,15 @@ impl Config {
             telegram_token,
             telegram_base: s(get, "TELEGRAM_API_BASE", "https://api.telegram.org").trim_end_matches('/').to_string(),
             state_path: PathBuf::from(s(get, "STATE_PATH", "/home/container/data/seen_posts.json")),
-            port: num(get, "PORT", 10000u16)?,
+            // Render sets PORT; Pterodactyl-style panels (Altare) set SERVER_PORT.
+            port: match first(get, &["PORT", "SERVER_PORT"]) {
+                Some(v) => v.trim().parse::<u16>().map_err(|e| anyhow!("PORT: {e}"))?,
+                None => 10000,
+            },
             self_ping,
             browser: BrowserSettings::from_lookup(get)?,
-            ffmpeg_bin: s(get, "FFMPEG_BIN", "ffmpeg"),
-            ffprobe_bin: s(get, "FFPROBE_BIN", "ffprobe"),
+            ffmpeg_bin: s(get, "FFMPEG_BIN", &discover_binary("ffmpeg")),
+            ffprobe_bin: s(get, "FFPROBE_BIN", &discover_binary("ffprobe")),
             // Telegram needs width+height <= 10000; it displays photos at <= 2560 px anyway.
             photo_max_dim: num(get, "PHOTO_MAX_DIM", 2560u32)?.clamp(320, 4999),
             max_photo_bytes: 10 * 1024 * 1024,
@@ -370,6 +458,23 @@ impl Config {
             },
             recycle_cycles: num(get, "BROWSER_RECYCLE_CYCLES", 12u64)?.max(1),
             seen_cap: num(get, "SEEN_CAP", 20000usize)?.clamp(100, 30000),
+            catchup_max_pages: if flag(get, "CATCHUP_ENABLED", true) {
+                num(get, "CATCHUP_MAX_PAGES", 6usize)?.clamp(1, 30)
+            } else {
+                1
+            },
+            catchup_max_age: Duration::from_secs(num(get, "CATCHUP_MAX_AGE_HOURS", 72u64)?.min(24 * 365) * 3600),
+            retry_batch: num(get, "RETRY_BATCH", 3usize)?.clamp(1, 20),
+            max_delivery_attempts: num(get, "MAX_DELIVERY_ATTEMPTS", 8u8)?.max(1),
+            gallery_resolve_timeout: duration_secs(get, "GALLERY_RESOLVE_TIMEOUT_SECS", 120, 10, 600)?,
+            browser_idle_shutdown: flag(get, "BROWSER_IDLE_SHUTDOWN", true),
+            silent_as_animation: flag(get, "SILENT_VIDEO_AS_ANIMATION", true),
+            health_enabled: flag(get, "HEALTH_ENABLED", true),
+            temp_dir: get("TEMP_DIR").map(PathBuf::from).or_else(|| {
+                // Panel hosts: /tmp may be a tiny tmpfs; the server's own data disk is safer.
+                let home = PathBuf::from("/home/container");
+                home.is_dir().then(|| home.join("tmp"))
+            }),
         })
     }
 }
@@ -550,5 +655,29 @@ mod tests {
         assert_eq!(cfg(&base, false).unwrap().self_ping.unwrap().0, "https://a.onrender.com");
         let off = [("TELEGRAM_BOT_TOKEN", "x"), ("RENDER_EXTERNAL_URL", "https://a"), ("SELF_PING_ENABLED", "false")];
         assert!(cfg(&off, false).unwrap().self_ping.is_none());
+    }
+
+    #[test]
+    fn dotenv_parsing_handles_comments_quotes_and_export() {
+        let m = parse_dotenv("# c\nTELEGRAM_BOT_TOKEN=\"abc:def\"\nexport SORT='new'\n\nBAD LINE\nSUBREDDITS = a,b \nX-Y=1\n");
+        assert_eq!(m.get("TELEGRAM_BOT_TOKEN").map(String::as_str), Some("abc:def"));
+        assert_eq!(m.get("SORT").map(String::as_str), Some("new"));
+        assert_eq!(m.get("SUBREDDITS").map(String::as_str), Some("a,b"));
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn catchup_defaults_and_overrides() {
+        let d = cfg(&[("TELEGRAM_BOT_TOKEN", "x")], false).unwrap();
+        assert_eq!(d.catchup_max_pages, 6);
+        assert_eq!(d.catchup_max_age, Duration::from_secs(72 * 3600));
+        assert_eq!((d.retry_batch, d.max_delivery_attempts), (3, 8));
+        assert!(d.browser_idle_shutdown && d.silent_as_animation && d.health_enabled);
+        let c = cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("CATCHUP_MAX_PAGES", "50"), ("CATCHUP_MAX_AGE_HOURS", "0"), ("SERVER_PORT", "25565")], false).unwrap();
+        assert_eq!(c.catchup_max_pages, 30);
+        assert!(c.catchup_max_age.is_zero());
+        assert_eq!(c.port, 25565);
+        let off = cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("CATCHUP_ENABLED", "false")], false).unwrap();
+        assert_eq!(off.catchup_max_pages, 1);
     }
 }
