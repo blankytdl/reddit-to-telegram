@@ -16,7 +16,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 use tokio::time::{timeout, Instant};
@@ -32,42 +32,87 @@ struct RotatingLog {
     written: u64,
 }
 
-#[derive(Clone)]
-struct LogMakeWriter(Arc<Mutex<RotatingLog>>);
-
-struct LogWriter(Arc<Mutex<RotatingLog>>);
-
-impl<'a> MakeWriter<'a> for LogMakeWriter {
-    type Writer = LogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriter(self.0.clone())
-    }
-}
-
-impl Write for LogWriter {
+impl Write for RotatingLog {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut log = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if log.written.saturating_add(buf.len() as u64) > LOG_ROTATE_BYTES {
-            log.file.flush()?;
-            let previous = log.path.with_extension("log.1");
+        if self.written.saturating_add(buf.len() as u64) > LOG_ROTATE_BYTES {
+            self.file.flush()?;
+            let previous = self.path.with_extension("log.1");
             match fs::remove_file(&previous) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
-            fs::rename(&log.path, &previous)?;
-            log.file = OpenOptions::new().create(true).append(true).open(&log.path)?;
-            log.written = 0;
+            fs::rename(&self.path, &previous)?;
+            self.file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+            self.written = 0;
         }
-        let n = log.file.write(buf)?;
-        log.written = log.written.saturating_add(n as u64);
+        let n = self.file.write(buf)?;
+        self.written = self.written.saturating_add(n as u64);
         Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).file.flush()
+        self.file.flush()
     }
+}
+
+/// Log lines travel through a bounded queue to a dedicated thread. If the console pipe or the log
+/// file stops accepting data (a panel that no longer drains the console, a stalled disk), only that
+/// thread blocks; the async runtime keeps running and, once the queue is full, new lines are dropped
+/// instead of freezing the bot. Before this, every `info!` wrote synchronously on a runtime thread.
+#[derive(Clone)]
+struct QueuedMakeWriter {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+}
+
+struct QueuedWriter {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    buf: Vec<u8>,
+}
+
+impl QueuedMakeWriter {
+    fn spawn(name: &str, mut sink: Box<dyn Write + Send>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4096);
+        let _ = std::thread::Builder::new().name(name.to_string()).spawn(move || {
+            for chunk in rx {
+                let _ = sink.write_all(&chunk);
+                let _ = sink.flush();
+            }
+        });
+        Self { tx }
+    }
+}
+
+impl<'a> MakeWriter<'a> for QueuedMakeWriter {
+    type Writer = QueuedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        QueuedWriter { tx: self.tx.clone(), buf: Vec::new() }
+    }
+}
+
+impl Write for QueuedWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for QueuedWriter {
+    fn drop(&mut self) {
+        if !self.buf.is_empty() {
+            // A full queue means the sink is stuck: drop the line rather than block.
+            let _ = self.tx.try_send(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
+fn log_path() -> PathBuf {
+    PathBuf::from(env_get("LOG_PATH").unwrap_or_else(|| "/home/container/logs/bot.log".into()))
 }
 
 fn init_tracing() {
@@ -75,8 +120,8 @@ fn init_tracing() {
         Some(v) => EnvFilter::try_new(v).unwrap_or_else(|_| EnvFilter::new("info")),
         None => EnvFilter::new("info"),
     };
-    let path = PathBuf::from(env_get("LOG_PATH").unwrap_or_else(|| "/home/container/logs/bot.log".into()));
-    let file_writer = (|| -> io::Result<LogMakeWriter> {
+    let path = log_path();
+    let file_writer = (|| -> io::Result<RotatingLog> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
@@ -93,16 +138,17 @@ fn init_tracing() {
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let written = file.metadata()?.len();
-        Ok(LogMakeWriter(Arc::new(Mutex::new(RotatingLog { path: path.clone(), file, written }))))
+        Ok(RotatingLog { path: path.clone(), file, written })
     })();
 
-    let console_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_writer(QueuedMakeWriter::spawn("log-console", Box::new(io::stderr())));
     match file_writer {
         Ok(writer) => {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(console_layer)
-                .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer))
+                .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(QueuedMakeWriter::spawn("log-file", Box::new(writer))))
                 .init();
             tracing::info!(log_path = %path.display(), "file logging enabled; console logging remains enabled");
         }
@@ -209,6 +255,10 @@ async fn run() -> Result<()> {
     }
 
     let tg = telegram::Telegram::new(http.clone(), cfg.telegram_base.clone(), cfg.telegram_token.clone(), cfg.telegram_timeout);
+    if !cfg.watchdog.is_zero() {
+        spawn_watchdog(health.clone(), cfg.watchdog);
+        info!(limit_secs = cfg.watchdog.as_secs(), "watchdog started");
+    }
     let sched = scheduler::Scheduler::new(
         cfg.clone(),
         reddit_browser::Browser::new(cfg.browser.clone()),
@@ -222,6 +272,45 @@ async fn run() -> Result<()> {
     let _ = timeout(Duration::from_secs(5), hs).await;
     info!("bye");
     Ok(())
+}
+
+/// Independent OS thread (not a tokio task, so a stuck runtime cannot stop it): if the scheduler
+/// shows no progress for `limit`, note it in the log file and exit non-zero so the host restarts
+/// the bot instead of leaving it frozen forever.
+fn spawn_watchdog(health: Arc<health::Health>, limit: Duration) {
+    let started = std::thread::Builder::new().name("watchdog".into()).spawn(move || {
+        let mut last_count = health.beat_count();
+        let mut last_change = std::time::Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            let count = health.beat_count();
+            if count != last_count {
+                last_count = count;
+                last_change = std::time::Instant::now();
+                continue;
+            }
+            if last_change.elapsed() < limit {
+                continue;
+            }
+            let note = format!(
+                "WATCHDOG: no scheduler progress for {}s (last stage: {}); exiting so the host restarts the bot\n",
+                last_change.elapsed().as_secs(),
+                health.stage_text()
+            );
+            let path = log_path();
+            // Best effort, on its own thread: a stuck disk must not prevent the exit below.
+            let _ = std::thread::spawn(move || {
+                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = f.write_all(note.as_bytes());
+                }
+            });
+            std::thread::sleep(Duration::from_secs(2));
+            std::process::exit(70);
+        }
+    });
+    if started.is_err() {
+        eprintln!("could not start the watchdog thread");
+    }
 }
 
 fn md_set_temp_dir(dir: PathBuf) {

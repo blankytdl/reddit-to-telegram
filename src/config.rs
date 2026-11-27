@@ -155,6 +155,8 @@ pub struct Config {
     pub silent_as_animation: bool,
     pub health_enabled: bool,
     pub temp_dir: Option<PathBuf>,
+    /// Exit (so the host restarts the bot) when the scheduler makes no progress for this long. ZERO = off.
+    pub watchdog: Duration,
 }
 
 type Get<'a> = &'a dyn Fn(&str) -> Option<String>;
@@ -470,6 +472,10 @@ impl Config {
             browser_idle_shutdown: flag(get, "BROWSER_IDLE_SHUTDOWN", true),
             silent_as_animation: flag(get, "SILENT_VIDEO_AS_ANIMATION", true),
             health_enabled: flag(get, "HEALTH_ENABLED", true),
+            watchdog: match num(get, "WATCHDOG_SECS", 900u64)? {
+                0 => Duration::ZERO,
+                n => Duration::from_secs(n.clamp(120, 86_400)),
+            },
             temp_dir: get("TEMP_DIR").map(PathBuf::from).or_else(|| {
                 // Panel hosts: /tmp may be a tiny tmpfs; the server's own data disk is safer.
                 let home = PathBuf::from("/home/container");
@@ -673,6 +679,11 @@ mod tests {
         assert_eq!(d.catchup_max_age, Duration::from_secs(72 * 3600));
         assert_eq!((d.retry_batch, d.max_delivery_attempts), (3, 8));
         assert!(d.browser_idle_shutdown && d.silent_as_animation && d.health_enabled);
+        assert_eq!(d.watchdog, Duration::from_secs(900));
+        let w = cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("WATCHDOG_SECS", "0")], false).unwrap();
+        assert!(w.watchdog.is_zero());
+        let w = cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("WATCHDOG_SECS", "5")], false).unwrap();
+        assert_eq!(w.watchdog, Duration::from_secs(120));
         let c = cfg(&[("TELEGRAM_BOT_TOKEN", "x"), ("CATCHUP_MAX_PAGES", "50"), ("CATCHUP_MAX_AGE_HOURS", "0"), ("SERVER_PORT", "25565")], false).unwrap();
         assert_eq!(c.catchup_max_pages, 30);
         assert!(c.catchup_max_age.is_zero());

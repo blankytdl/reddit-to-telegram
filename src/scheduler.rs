@@ -122,6 +122,12 @@ fn retry_as_document(e: &TgError, kind: FileKind) -> bool {
     !["chat", "rights", "forbidden", "caption", "blocked", "kicked", "entities", "parse"].iter().any(|w| d.contains(w))
 }
 
+/// After both canonical Reddit hosts answer a gallery JSON request with a network-security block,
+/// stop sending JSON requests for this long (they are blocked per IP, so more requests only add load).
+const JSON_BLOCK_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+/// A lookup attempt with less time than this left is skipped rather than run with a useless timeout.
+const MIN_LOOKUP_ATTEMPT: Duration = Duration::from_secs(10);
+
 /// Errors that retrying cannot fix (dead link, wrong content, file too large).
 fn is_permanent_item_error(e: &anyhow::Error) -> bool {
     if md::is_too_large(e) {
@@ -695,11 +701,15 @@ pub struct Scheduler {
     cycles: u64,
     penalty: Duration,
     next_group: usize,
+    /// Telegram asked us to stop sending until this moment (HTTP 429 flood control).
+    flood_until: Option<Instant>,
+    /// Gallery JSON routes are blocked for this IP until this moment.
+    json_blocked_until: Option<Instant>,
 }
 
 impl Scheduler {
     pub fn new(cfg: Arc<Config>, browser: Browser, store: SeenStore, deliverer: Deliverer, health: Arc<Health>, token: CancellationToken) -> Self {
-        Self { cfg, browser, store, deliverer, health, token, cycles: 0, penalty: Duration::ZERO, next_group: 0 }
+        Self { cfg, browser, store, deliverer, health, token, cycles: 0, penalty: Duration::ZERO, next_group: 0, flood_until: None, json_blocked_until: None }
     }
 
     pub async fn run(mut self) {
@@ -760,6 +770,8 @@ impl Scheduler {
                     _ = self.token.cancelled() => break,
                     _ = sleep(tick) => {
                         remaining = remaining.saturating_sub(tick);
+                        // Progress report first: the watchdog must see this even if logging stalls.
+                        self.health.set_stage("idle until next poll", remaining.as_secs());
                         if !remaining.is_zero() {
                             info!(next_in_secs = remaining.as_secs(), "waiting for next poll");
                         }
@@ -1031,10 +1043,17 @@ impl Scheduler {
         let canonical_permalink = p.permalink
             .replace("http://old.reddit.com", "https://www.reddit.com")
             .replace("https://old.reddit.com", "https://www.reddit.com");
-        let urls = gallery_metadata_urls(&canonical_permalink, id, &primary_base, &alternate_base);
+        let json_blocked = self.json_blocked_until.is_some_and(|until| Instant::now() < until);
+        let urls = if json_blocked {
+            debug!(post = %p.id, "skipping gallery JSON routes: Reddit recently blocked them for this IP");
+            Vec::new()
+        } else {
+            gallery_metadata_urls(&canonical_permalink, id, &primary_base, &alternate_base)
+        };
 
         let mut last_error: Option<anyhow::Error> = None;
         let mut rate_limited = false;
+        let mut blocked_routes = 0u32;
         for (index, (url, route)) in urls.iter().enumerate() {
             let left = json_budget.saturating_sub(started.elapsed());
             if left.is_zero() {
@@ -1048,8 +1067,12 @@ impl Scheduler {
                 break;
             }
 
+            let page_timeout = self.cfg.gallery_lookup_timeout.min(left);
+            if page_timeout < MIN_LOOKUP_ATTEMPT {
+                break;
+            }
             info!(post = %p.id, attempt = index + 1, route = *route, "gallery metadata lookup started");
-            let body = match self.browser.fetch_text_with_timeout(url, self.cfg.gallery_lookup_timeout.min(left)).await {
+            let body = match self.browser.fetch_text_with_timeout(url, page_timeout).await {
                 Ok(body) => body,
                 Err(e) => {
                     last_error = Some(e);
@@ -1061,6 +1084,12 @@ impl Scheduler {
             if response_kind == "network_security_block" {
                 warn!(post = %p.id, route = *route, response_kind, response_bytes = body.len(), "Reddit blocked gallery metadata route");
                 last_error = Some(anyhow::anyhow!("Reddit returned an explicit network-security block page for gallery metadata ({route})"));
+                blocked_routes += 1;
+                if blocked_routes >= 2 {
+                    warn!(post = %p.id, cooldown_mins = JSON_BLOCK_COOLDOWN.as_secs() / 60, "both Reddit hosts blocked the gallery JSON routes; using the HTML page and pausing JSON lookups");
+                    self.json_blocked_until = Some(Instant::now() + JSON_BLOCK_COOLDOWN);
+                    break;
+                }
                 continue;
             }
             if response_kind == "rate_limited" {
@@ -1073,6 +1102,7 @@ impl Scheduler {
             match parse_gallery(&body) {
                 Ok(items) => {
                     info!(post = %p.id, route = *route, items = items.len(), response_kind, "gallery metadata parsed");
+                    self.json_blocked_until = None;
                     return Ok(items);
                 }
                 Err(e) => {
@@ -1084,11 +1114,11 @@ impl Scheduler {
         }
 
         if !rate_limited {
-            let html_urls = [
-                canonical_permalink.clone(),
-                format!("https://www.reddit.com/gallery/{id}"),
-                format!("https://old.reddit.com/comments/{id}/"),
-            ];
+            // Only old.reddit renders the gallery tiles without Reddit's new JS app (which never
+            // hydrates in Lightpanda: 0 of 636 www attempts worked in production logs, versus 78 %
+            // for old.reddit). The second entry is a plain retry for a transient page failure.
+            let old_page = format!("https://old.reddit.com/comments/{id}/");
+            let html_urls = [old_page.clone(), old_page];
             for (index, url) in html_urls.iter().enumerate() {
                 let left = budget.saturating_sub(started.elapsed());
                 if left.is_zero() {
@@ -1101,8 +1131,12 @@ impl Scheduler {
                 if left.is_zero() {
                     break;
                 }
+                let page_timeout = self.cfg.gallery_lookup_timeout.min(left);
+                if page_timeout < MIN_LOOKUP_ATTEMPT {
+                    break;
+                }
                 info!(post = %p.id, attempt = index + 1, "gallery HTML fallback started");
-                match self.browser.fetch_gallery_with_timeout(url, self.cfg.gallery_lookup_timeout.min(left)).await {
+                match self.browser.fetch_gallery_with_timeout(url, page_timeout).await {
                     Ok(body) => match parse_gallery_dom(&body) {
                         Ok(items) => {
                             info!(post = %p.id, items = items.len(), "gallery HTML extracted");
@@ -1202,6 +1236,18 @@ impl Scheduler {
         self.store.contains(id) || self.store.contains(&format!("{chat}|{id}"))
     }
 
+    /// True while Telegram's flood-control wait is running (and clears it once it has passed).
+    fn flood_active(&mut self) -> bool {
+        match self.flood_until {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                self.flood_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
     /// Seen, or already queued for retry: either way the retry queue owns it.
     fn is_known(&self, chat: &str, id: &str) -> bool {
         self.is_seen(chat, id) || self.store.has_pending(chat, id)
@@ -1221,6 +1267,26 @@ impl Scheduler {
     /// (or at once for permanent failures such as files over Telegram's size limit), so one
     /// undeliverable post can never clog the retry queue forever.
     async fn record_failure(&mut self, chat: &str, post: &Post, media_only: bool, gallery_index: usize, attempts: u8, error: &anyhow::Error) {
+        // Telegram flood control: not the post's fault. Pause all sending until the wait is over,
+        // keep the post queued without using up one of its attempts.
+        let flood_wait = error
+            .downcast_ref::<TgError>()
+            .filter(|e| e.code == 429)
+            .map(|e| e.retry_after.unwrap_or(30).saturating_add(5));
+        if let Some(wait) = flood_wait {
+            self.flood_until = Some(Instant::now() + Duration::from_secs(wait));
+            self.store.upsert_pending(PendingDelivery {
+                chat: chat.to_string(),
+                post: post.clone(),
+                media_only,
+                attempts: attempts.saturating_sub(1),
+                retry_at_unix: unix_now().saturating_add(wait),
+                gallery_index,
+            });
+            self.store.flush().await;
+            warn!(post = %post.id, wait_secs = wait, "Telegram flood control; pausing sends and retrying after the wait");
+            return;
+        }
         let permanent = md::is_too_large(error);
         if permanent || attempts >= self.cfg.max_delivery_attempts {
             warn!(post = %post.id, attempts, permanent, reason = %error, "giving up on post; marked seen so it cannot block the queue");
@@ -1249,7 +1315,7 @@ impl Scheduler {
         // large retry queue cannot starve new subreddit polling.
         let due = self.store.pending_due(unix_now(), self.cfg.retry_batch);
         for mut item in due {
-            if self.token.is_cancelled() || cycle_started.elapsed() >= self.cfg.cycle_budget {
+            if self.token.is_cancelled() || cycle_started.elapsed() >= self.cfg.cycle_budget || self.flood_active() {
                 break;
             }
 
@@ -1423,6 +1489,10 @@ impl Scheduler {
             }
             if self.token.is_cancelled() {
                 return; // unprocessed posts remain unseen and will be picked up next cycle
+            }
+            if self.flood_active() {
+                info!(sub = %g.names.join("+"), "Telegram flood control active; remaining posts wait for the next poll");
+                break;
             }
             let sub: String = if p.subreddit.is_empty() { g.names[0].clone() } else { p.subreddit.clone() };
             self.health.set_stage(&format!("post {} from r/{sub}", p.id), 0);
@@ -1743,5 +1813,14 @@ mod tests {
         assert_eq!(vreddit_id("https://v.redd.it/abc123?x=1"), Some("abc123".to_string()));
         assert_eq!(vreddit_id("https://i.redd.it/abc123.jpg"), None);
         assert_eq!(vreddit_id("https://v.redd.it/../x"), None);
+    }
+
+    #[test]
+    fn telegram_flood_errors_stay_detectable_through_anyhow() {
+        let e: anyhow::Error = TgError { code: 429, desc: "Too Many Requests: retry after 242".into(), retry_after: Some(242) }.into();
+        let found = e.downcast_ref::<TgError>().filter(|t| t.code == 429).and_then(|t| t.retry_after);
+        assert_eq!(found, Some(242));
+        let other: anyhow::Error = TgError { code: 400, desc: "Bad Request".into(), retry_after: None }.into();
+        assert!(other.downcast_ref::<TgError>().filter(|t| t.code == 429).is_none());
     }
 }

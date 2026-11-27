@@ -20,6 +20,8 @@ pub struct Health {
     last_beat: AtomicU64,
     deadline: AtomicU64,
     cycles: AtomicU64,
+    /// Incremented on every progress report; the watchdog thread watches it (monotonic, clock-jump safe).
+    beats: AtomicU64,
     stage: Mutex<String>,
 }
 
@@ -30,16 +32,25 @@ pub fn is_stalled(now: u64, deadline: u64) -> bool {
 impl Health {
     pub fn new() -> Self {
         let n = now();
-        Self { last_beat: AtomicU64::new(n), deadline: AtomicU64::new(n + 20 * 60), cycles: AtomicU64::new(0), stage: Mutex::new("starting".into()) }
+        Self { last_beat: AtomicU64::new(n), deadline: AtomicU64::new(n + 20 * 60), cycles: AtomicU64::new(0), beats: AtomicU64::new(0), stage: Mutex::new("starting".into()) }
     }
     /// Progress marker exposed by /health. `planned_wait` is the intentional idle period.
     pub fn set_stage(&self, stage: &str, planned_wait_secs: u64) {
         let n = now();
         self.last_beat.store(n, Ordering::Relaxed);
         self.deadline.store(n + planned_wait_secs + STALL_MARGIN_SECS, Ordering::Relaxed);
+        self.beats.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut current) = self.stage.lock() {
             *current = stage.chars().take(160).collect();
         }
+    }
+
+    pub fn beat_count(&self) -> u64 {
+        self.beats.load(Ordering::Relaxed)
+    }
+
+    pub fn stage_text(&self) -> String {
+        self.stage.lock().map(|s| s.clone()).unwrap_or_else(|_| "unavailable".into())
     }
 
     pub fn beat(&self, planned_wait_secs: u64) {
@@ -88,5 +99,15 @@ mod tests {
         let h = Health::new();
         h.beat(0);
         assert!(!is_stalled(now(), h.deadline.load(Ordering::Relaxed)));
+    }
+
+    #[test]
+    fn progress_reports_advance_the_watchdog_counter() {
+        let health = Health::new();
+        let before = health.beat_count();
+        health.set_stage("fetching", 0);
+        health.beat(0);
+        assert_eq!(health.beat_count(), before + 2);
+        assert_eq!(health.stage_text(), "scheduler");
     }
 }

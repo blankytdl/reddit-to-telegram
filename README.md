@@ -32,6 +32,17 @@ Your existing Python implementation is untouched: this lives in its own director
 - Mature-content/quarantine interstitials are now reported instead of looking like an empty subreddit.
 - First run is unchanged: a stream with no history is seeded, not flooded (`SEND_BACKLOG_ON_FIRST_RUN`).
 
+**Fixes driven by a production log (24-26 Nov)** - the log showed no crash or restart (continuous output, no panic/OOM); the problems were:
+- Reddit blocks the gallery JSON routes ("blocked by network security") for the host's IP, and every attempt sent six of them (1,627 blocked requests). After both hosts block, JSON lookups now pause for 30 minutes and the old.reddit page is used directly.
+- The `www.reddit.com` gallery pages never hydrate in Lightpanda (0 of 636 attempts) while `old.reddit.com` worked 78 % of the time (56 of 72). The HTML fallback now uses only old.reddit (twice, for transient failures).
+- Lookup attempts were sometimes started with 2-3 s left in the budget and failed instantly; an attempt with under 10 s left is now skipped.
+- Telegram answered `429 retry after 242` while the bot kept downloading more posts. A 429 now pauses all sending until the wait is over and re-queues the post without using up one of its attempts.
+- Videos over Telegram's 50 MB bot-upload limit (seen at 57-99 MB even at the lowest rendition) are still skipped; that is a Telegram limit, not a bug (a local Bot API server raises it to 2 GB).
+
+**Freeze protection** (a log that simply stopped after a normal "waiting for next poll" line)
+- Every log line used to be written synchronously on an async worker thread (stderr and the log file under a mutex). If the host stopped draining the console, or a disk write stalled, that thread blocked forever inside `info!` and the whole bot appeared frozen right after its newest log line. Logs now go through a bounded queue to dedicated writer threads; if a sink is stuck, lines are dropped instead of blocking the bot.
+- A watchdog OS thread (`WATCHDOG_SECS`, default 900) watches a progress counter that the scheduler bumps at every stage and every idle minute. If nothing moves, it appends a `WATCHDOG:` line to the log file and exits with code 70 so the panel restarts the bot. Make sure the Altare server has auto-restart on crash enabled.
+
 **Altare**
 - Optional `.env` file; `SERVER_PORT` is honoured; the health endpoint can be disabled; binaries are auto-discovered; startup prints which of Lightpanda/ffmpeg/ffprobe were found and what degrades without them; temp files go to `/home/container/tmp` and stale ones are purged; the browser is stopped between polls; Lightpanda telemetry is disabled.
 
